@@ -36,7 +36,8 @@ Ficheros y llamadas nunca pasan por el buzón (`§62`, `§66`).
 
 `POST /v1/device/register`, `PUT /v1/device/push`, `DELETE /v1/device`,
 `POST /v1/wake/{device_id}`, `POST /v1/mailbox/{device_id}`, `GET /v1/mailbox`,
-`DELETE /v1/mailbox/{blob_id}`; más adelante, quizá `POST /v1/signal/{device_id}`.
+`DELETE /v1/mailbox/{blob_id}`, `GET /v1/turn-credentials`; más adelante, quizá
+`POST /v1/signal/{device_id}`.
 
 ## Reglas
 
@@ -47,6 +48,8 @@ Ficheros y llamadas nunca pasan por el buzón (`§62`, `§66`).
 - **Logs** (`§71`): sin access logs, sin cuerpos, sin `device_id`, push tokens ni IPs. Métricas
   solo agregadas (`requests_total`, `wake_success_total`, `wake_failure_total`, `fcm_latency`,
   `apns_latency`, `http_errors`) y sin etiquetas identificativas.
+- **Credenciales TURN** (`§17`): temporales (minutos), con un usuario aleatorio por sesión, nunca
+  el `device_id`, y contraseña HMAC con el secreto compartido de coturn.
 - Los **reportes** de abuso no van aquí: infraestructura separada (`§36`).
 
 ## Pendiente de diseño
