@@ -1,0 +1,110 @@
+//! FlickerTalk router (Plan §8–19).
+//!
+//! For now it only holds the PoC 0 signalling relay (§87): two peers join a room over a WebSocket
+//! and the relay forwards their text messages to each other. In the real design signalling travels
+//! through push (§13); this relay is temporary and exists to test WebRTC between devices.
+//!
+//! Nothing is stored or logged: rooms live in memory and disappear with their last peer (§71).
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Path, State};
+use axum::response::Response;
+use axum::routing::get;
+use axum::Router;
+use futures_util::{SinkExt, StreamExt};
+use tokio::sync::{mpsc, Mutex};
+
+/// Sent to a newcomer when someone is already in the room.
+pub const PEER_PRESENT: &str = r#"{"kind":"peer_present"}"#;
+/// Sent to the peers already in a room when someone joins.
+pub const PEER_JOINED: &str = r#"{"kind":"peer_joined"}"#;
+/// Sent to the remaining peers when someone leaves.
+pub const PEER_LEFT: &str = r#"{"kind":"peer_left"}"#;
+
+type Outbox = mpsc::UnboundedSender<String>;
+
+#[derive(Clone, Default)]
+struct Rooms {
+    peers: Arc<Mutex<HashMap<String, HashMap<u64, Outbox>>>>,
+    next_id: Arc<AtomicU64>,
+}
+
+pub fn app() -> Router {
+    Router::new().route("/poc/rooms/{room}", get(join)).with_state(Rooms::default())
+}
+
+async fn join(socket: WebSocketUpgrade, Path(room): Path<String>, State(rooms): State<Rooms>) -> Response {
+    socket.on_upgrade(move |socket| relay(socket, room, rooms))
+}
+
+async fn relay(socket: WebSocket, room: String, rooms: Rooms) {
+    let id = rooms.next_id.fetch_add(1, Ordering::Relaxed);
+    let (outbox, mut pending) = mpsc::unbounded_channel::<String>();
+
+    {
+        let mut all = rooms.peers.lock().await;
+        let peers = all.entry(room.clone()).or_default();
+        if !peers.is_empty() {
+            let _ = outbox.send(PEER_PRESENT.to_owned());
+            broadcast(peers, id, PEER_JOINED);
+        }
+        peers.insert(id, outbox);
+    }
+
+    let (mut sink, mut stream) = socket.split();
+    let writer = tokio::spawn(async move {
+        while let Some(text) = pending.recv().await {
+            if sink.send(Message::Text(text.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    while let Some(Ok(message)) = stream.next().await {
+        if let Message::Text(text) = message {
+            if let Some(peers) = rooms.peers.lock().await.get(&room) {
+                broadcast(peers, id, text.as_str());
+            }
+        }
+    }
+
+    let mut all = rooms.peers.lock().await;
+    if let Some(peers) = all.get_mut(&room) {
+        peers.remove(&id);
+        broadcast(peers, id, PEER_LEFT);
+        if peers.is_empty() {
+            all.remove(&room);
+        }
+    }
+    writer.abort();
+}
+
+/// Sends `text` to every peer of the room except `from`.
+fn broadcast(peers: &HashMap<u64, Outbox>, from: u64, text: &str) {
+    for (id, outbox) in peers {
+        if *id != from {
+            let _ = outbox.send(text.to_owned());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_broadcast_skips_the_sender() {
+        let (to_sender, mut sender_inbox) = mpsc::unbounded_channel();
+        let (to_other, mut other_inbox) = mpsc::unbounded_channel();
+        let peers = HashMap::from([(1, to_sender), (2, to_other)]);
+
+        broadcast(&peers, 1, "hi");
+
+        assert_eq!(other_inbox.try_recv().ok().as_deref(), Some("hi"));
+        assert!(sender_inbox.try_recv().is_err());
+    }
+}
