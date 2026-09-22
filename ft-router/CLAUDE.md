@@ -59,26 +59,31 @@ Ficheros y llamadas nunca pasan por el buzón (`§62`, `§66`).
 - Buzón (`§19`): va en PostgreSQL (infraestructura en el repo privado), TTL definitivo,
   sealed sender (que el servidor no sepa quién envía), tamaño máximo y cuotas.
 
-## Estado: relay del PoC 0 (2026-09-22)
+## Estado: API v1 (2026-09-22, `§106` M2)
 
-De momento solo existe el relay de señalización del PoC (`§87`): WebSocket en
-`/poc/rooms/{room}` que reenvía el texto entre los pares de una sala y avisa de quién entra y sale.
-En memoria, sin guardar ni registrar nada. Es temporal: la señalización real irá por push. Como
-las salas viven en memoria, el relay corre con **una réplica**.
-
-- Lo primero que recibe cada par es una bienvenida:
-  `{"kind":"welcome","stun":[…],"turn":{"urls":[…],"username":"<caducidad>:<aleatorio>","credential":"…"}}`
-  (`turn: null` sin secreto configurado). Las credenciales las firma `turn::TurnIssuer`, que servirá
-  también para `GET /v1/turn-credentials`.
-- `GET /health` → `200 ok`, para las comprobaciones del balanceador.
-- Configuración por entorno: `FT_ROUTER_ADDR` (por defecto `0.0.0.0:8787`), `FT_STUN_URLS` y
-  `FT_TURN_URLS` (separadas por comas) y `FT_TURN_SECRET_FILE` (el secret de Swarm compartido
-  con coturn; sin él no se emiten usuarios TURN).
-- Imagen: `Dockerfile` en `server/` (binario sobre distroless, sin shell, usuario sin
-  privilegios, ~26 MB).
+- **Peticiones firmadas** (`auth.rs`, `§7`): cabeceras `ft-device`, `ft-time`, `ft-nonce` y
+  `ft-signature` (Ed25519, base64 sin relleno) sobre
+  `FT1\n{METODO}\n{RUTA}\n{hora ms}\n{nonce}\n{hex BLAKE3 del cuerpo}`. Ventana de ±5 min y cada
+  nonce una sola vez por dispositivo. El cliente (`ft-push`) construye el mismo texto: los dos lados
+  lo fijan con tests.
+- **PostgreSQL** (`db.rs`): `devices` (clave pública y hash de la route capability) y `mailbox`
+  **UNLOGGED** (sin remitente ni fecha de creación; caduca a los 7 días, máx. 64 KiB por blob y 1000
+  por dispositivo). Un test comprueba en `pg_class` que el buzón es `UNLOGGED`.
+- **Rutas** (`v1.rs`): `POST /v1/device/register`, `DELETE /v1/device`, `GET /v1/connect`
+  (WebSocket firmado: bienvenida con STUN y usuario TURN, señales y aviso de correo),
+  `POST /v1/signal/{to}` (capability del destinatario; 404 si no está conectado),
+  `POST /v1/mailbox/{to}` (capability, sin identidad del remitente), `GET /v1/mailbox`,
+  `DELETE /v1/mailbox/{id}` y `GET /v1/turn-credentials`.
+- Las conexiones viven en memoria: la señalización exige **una réplica** hasta repartirla con
+  PostgreSQL.
+- Configuración: `FT_DATABASE_URL` o `FT_DATABASE_URL_FILE` (secret de Swarm), `FT_STUN_URLS`,
+  `FT_TURN_URLS`, `FT_TURN_SECRET_FILE`, `FT_ROUTER_ADDR`. Sin base de datos solo sirve el relay del
+  PoC y `/health`.
+- El relay del PoC 0 (`/poc/rooms/{room}`) sigue disponible para la pantalla de pruebas.
 
 ```sh
-cargo test -p ft-router        # desde server/
-cargo run -p ft-router         # escucha en 0.0.0.0:8787
-docker build -t ft-router .    # desde server/ (x86 en producción)
+docker run -d --name ft-pg-test -e POSTGRES_PASSWORD=test -e POSTGRES_DB=ft_router_test \
+  -p 127.0.0.1:55432:5432 postgres:17-alpine     # base de datos de los tests
+cargo test -p ft-router                          # desde server/
+docker build -t ft-router .                      # x86 en producción
 ```

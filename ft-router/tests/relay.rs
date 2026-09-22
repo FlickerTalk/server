@@ -68,6 +68,7 @@ async fn welcomes_each_peer_with_the_stun_servers_and_a_temporary_turn_user() {
             vec!["turn:turn.example:3478".to_owned()],
             Duration::from_secs(600),
         )),
+        ..Config::default()
     };
     let base = start_relay_with(config).await;
     let mut first = join_raw(&base, "r1").await;

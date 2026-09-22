@@ -1,5 +1,7 @@
+use std::sync::Arc;
 use std::time::Duration;
 
+use ft_router::db::Db;
 use ft_router::turn::TurnIssuer;
 use ft_router::Config;
 use tokio::net::TcpListener;
@@ -30,14 +32,35 @@ fn config_from(stun: Option<String>, turn: Option<String>, secret: Option<Vec<u8
         let secret = secret.trim_ascii_end().to_vec();
         TurnIssuer::new(secret, server_list(turn), TURN_TTL)
     });
-    Config { stun: server_list(stun), turn }
+    Config { stun: server_list(stun), turn, db: None }
 }
+
+/// `FT_DATABASE_URL`, or the contents of the file named by `FT_DATABASE_URL_FILE`.
+fn database_url(variable: Option<String>, file: Option<Vec<u8>>) -> Option<String> {
+    variable.or_else(|| file.map(|bytes| String::from_utf8_lossy(bytes.trim_ascii_end()).into_owned()))
+}
+
+/// Expired mail is deleted every hour (§19).
+const PURGE_EVERY: Duration = Duration::from_secs(60 * 60);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let variable = |name: &str| std::env::var(name).ok();
     let secret = variable("FT_TURN_SECRET_FILE").map(std::fs::read).transpose()?;
-    let config = config_from(variable("FT_STUN_URLS"), variable("FT_TURN_URLS"), secret);
+    let mut config = config_from(variable("FT_STUN_URLS"), variable("FT_TURN_URLS"), secret);
+    let url_file = variable("FT_DATABASE_URL_FILE").map(std::fs::read).transpose()?;
+    if let Some(url) = database_url(variable("FT_DATABASE_URL"), url_file) {
+        let db = Arc::new(Db::connect(&url).await?);
+        let purging = db.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(PURGE_EVERY);
+            loop {
+                every.tick().await;
+                let _ = purging.purge_expired().await;
+            }
+        });
+        config.db = Some(db);
+    }
 
     let listener = TcpListener::bind(listen_address(variable("FT_ROUTER_ADDR"))).await?;
     axum::serve(listener, ft_router::app(config)).await?;
@@ -64,6 +87,14 @@ mod tests {
         let config = config_from(Some("stun:a:3478, stun:b:3478".to_owned()), None, None);
         assert_eq!(config.stun, ["stun:a:3478", "stun:b:3478"]);
         assert!(config_from(None, None, None).stun.is_empty());
+    }
+
+    // The URL carries the database password, so in the cluster it comes from a Swarm secret file.
+    #[test]
+    fn the_database_url_comes_from_the_environment_or_a_secret_file() {
+        assert_eq!(database_url(Some("postgres://a".to_owned()), None).as_deref(), Some("postgres://a"));
+        assert_eq!(database_url(None, Some(b"postgres://b\n".to_vec())).as_deref(), Some("postgres://b"));
+        assert_eq!(database_url(None, None), None);
     }
 
     // Swarm secrets are files; the trailing newline is not part of the secret.
