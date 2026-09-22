@@ -9,7 +9,10 @@
 //! Every peer first gets a welcome with the ICE servers to use: our STUN and, if configured, a
 //! temporary TURN user for that session only (§16–17).
 
+pub mod auth;
+pub mod db;
 pub mod turn;
+pub mod v1;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,6 +27,7 @@ use axum::Router;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, Mutex};
 
+use crate::db::Db;
 use crate::turn::TurnIssuer;
 
 /// Sent to a newcomer when someone is already in the room.
@@ -35,11 +39,13 @@ pub const PEER_LEFT: &str = r#"{"kind":"peer_left"}"#;
 
 type Outbox = mpsc::UnboundedSender<String>;
 
-/// The ICE servers handed to every peer.
+/// The ICE servers handed to every peer and, for API v1, the database.
 #[derive(Clone, Default)]
 pub struct Config {
     pub stun: Vec<String>,
     pub turn: Option<TurnIssuer>,
+    /// Without a database only the PoC relay and the health check are served.
+    pub db: Option<Arc<Db>>,
 }
 
 #[derive(Clone, Default)]
@@ -50,10 +56,18 @@ struct Rooms {
 }
 
 pub fn app(config: Config) -> Router {
-    Router::new()
+    let v1 = config
+        .db
+        .clone()
+        .map(|db| v1::routes(Arc::new(v1::Hub::new(db, config.stun.clone(), config.turn.clone()))));
+    let router = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/poc/rooms/{room}", get(join))
-        .with_state(Rooms { config: Arc::new(config), ..Rooms::default() })
+        .with_state(Rooms { config: Arc::new(config), ..Rooms::default() });
+    match v1 {
+        Some(v1) => router.merge(v1),
+        None => router,
+    }
 }
 
 async fn join(socket: WebSocketUpgrade, Path(room): Path<String>, State(rooms): State<Rooms>) -> Response {
