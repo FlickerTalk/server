@@ -71,7 +71,9 @@ pub fn app(config: Config) -> Router {
         .db
         .clone()
         .map(|db| v1::routes(Arc::new(v1::Hub::new(db, config.stun.clone(), config.turn.clone(), config.push.clone(), config.limits))));
-    let mut router = Router::new().route("/health", get(|| async { "ok" }));
+    let mut router = Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .route("/version", get(|| async { env!("CARGO_PKG_VERSION") }));
     if config.poc_relay {
         router = router.route("/poc/rooms/{room}", get(join));
     }
