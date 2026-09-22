@@ -58,3 +58,15 @@ Ficheros y llamadas nunca pasan por el buzón (`§62`, `§66`).
   `device_id = BLAKE3(public_identity_key)`).
 - Buzón (`§19`): va en PostgreSQL (infraestructura en el repo privado), TTL definitivo,
   sealed sender (que el servidor no sepa quién envía), tamaño máximo y cuotas.
+
+## Estado: relay del PoC 0 (2026-09-22)
+
+De momento solo existe el relay de señalización del PoC (`§87`): WebSocket en
+`/poc/rooms/{room}` que reenvía el texto entre los pares de una sala y avisa de quién entra y sale.
+En memoria, sin guardar ni registrar nada. Es temporal: la señalización real irá por push.
+
+```sh
+cargo test -p ft-router        # desde server/
+cargo run -p ft-router         # escucha en 0.0.0.0:8787 (FT_ROUTER_ADDR para cambiarlo)
+```
+
