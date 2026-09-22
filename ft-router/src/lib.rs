@@ -12,6 +12,9 @@
 pub mod auth;
 pub mod db;
 pub mod turn;
+pub mod push;
+
+pub use push::Push;
 pub mod v1;
 
 use std::collections::HashMap;
@@ -46,6 +49,8 @@ pub struct Config {
     pub turn: Option<TurnIssuer>,
     /// Without a database only the PoC relay and the health check are served.
     pub db: Option<Arc<Db>>,
+    /// Without it, devices that are not connected are never woken.
+    pub push: Option<Arc<Push>>,
 }
 
 #[derive(Clone, Default)]
@@ -59,7 +64,7 @@ pub fn app(config: Config) -> Router {
     let v1 = config
         .db
         .clone()
-        .map(|db| v1::routes(Arc::new(v1::Hub::new(db, config.stun.clone(), config.turn.clone()))));
+        .map(|db| v1::routes(Arc::new(v1::Hub::new(db, config.stun.clone(), config.turn.clone(), config.push.clone()))));
     let router = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/poc/rooms/{room}", get(join))

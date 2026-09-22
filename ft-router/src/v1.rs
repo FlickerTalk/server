@@ -9,6 +9,9 @@
 //!   router does not learn who writes to whom through the mailbox.
 //! - `GET /v1/mailbox`, `DELETE /v1/mailbox/{id}`: signed by the owner.
 //! - `GET /v1/turn-credentials`, `DELETE /v1/device`: signed.
+//! - `PUT /v1/device/push`, `DELETE /v1/device/push`: signed; where the device can be woken, kept
+//!   encrypted (§8). A device that is not connected is woken when a signal or mail arrives for it,
+//!   with nothing in the push (§12).
 //!
 //! Nothing is logged (§71). Connections live in memory, so signalling needs a single replica
 //! until it is shared through PostgreSQL (§106).
@@ -22,7 +25,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use base64::Engine;
 use serde::Deserialize;
@@ -31,6 +34,7 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::auth::{self, decode_base64, ReplayGuard, SignedRequest, STANDARD_NO_PAD};
 use crate::db::{Db, MAX_BLOB};
+use crate::push::{Push, Wake, FCM, MAX_TOKEN};
 use crate::turn::TurnIssuer;
 
 /// How long a blob waits in a mailbox (§19, provisional).
@@ -46,11 +50,12 @@ pub struct Hub {
     online: Mutex<HashMap<String, mpsc::UnboundedSender<String>>>,
     stun: Vec<String>,
     turn: Option<TurnIssuer>,
+    push: Option<Arc<Push>>,
 }
 
 impl Hub {
-    pub fn new(db: Arc<Db>, stun: Vec<String>, turn: Option<TurnIssuer>) -> Self {
-        Self { db, guard: ReplayGuard::default(), online: Mutex::default(), stun, turn }
+    pub fn new(db: Arc<Db>, stun: Vec<String>, turn: Option<TurnIssuer>, push: Option<Arc<Push>>) -> Self {
+        Self { db, guard: ReplayGuard::default(), online: Mutex::default(), stun, turn, push }
     }
 }
 
@@ -58,6 +63,7 @@ pub fn routes(hub: Arc<Hub>) -> Router {
     Router::new()
         .route("/v1/device/register", post(register))
         .route("/v1/device", delete(forget))
+        .route("/v1/device/push", put(set_push).delete(clear_push))
         .route("/v1/connect", get(connect))
         .route("/v1/signal/{to}", post(signal))
         .route("/v1/mailbox", get(collect))
@@ -162,6 +168,53 @@ async fn forget(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Result<Statu
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Deserialize)]
+struct PushTarget {
+    provider: String,
+    token: String,
+}
+
+async fn set_push(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: Bytes) -> Result<StatusCode, StatusCode> {
+    let device = authenticate(&hub, "PUT", "/v1/device/push", Signature::from_headers(&headers), &body, None).await?;
+    let target: PushTarget = serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if target.provider != FCM || target.token.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if target.token.len() > MAX_TOKEN {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    let push = hub.push.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let sealed = push.vault.seal(&target.token);
+    match hub.db.set_push(&device, &target.provider, &sealed).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::UNAUTHORIZED),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn clear_push(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Result<StatusCode, StatusCode> {
+    let device = authenticate(&hub, "DELETE", "/v1/device/push", Signature::from_headers(&headers), b"", None).await?;
+    hub.db.clear_push(&device).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Wakes a device that is not connected, in the background and at most once in a while. A token
+/// the provider no longer knows is forgotten.
+fn wake(hub: &Arc<Hub>, device: &str) {
+    let Some(push) = hub.push.clone() else { return };
+    if !push.limiter.allow(device) {
+        return;
+    }
+    let (hub, device) = (hub.clone(), device.to_owned());
+    tokio::spawn(async move {
+        let Ok(Some((_, sealed))) = hub.db.push_of(&device).await else { return };
+        let Ok(token) = push.vault.open(&sealed) else { return };
+        if push.waker.wake(&token).await == Wake::Unregistered {
+            let _ = hub.db.clear_push(&device).await;
+        }
+    });
+}
+
 async fn connect(
     State(hub): State<Arc<Hub>>,
     Query(query): Query<HashMap<String, String>>,
@@ -214,6 +267,7 @@ async fn signal(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: He
     if notify(&hub, &to, message).await {
         StatusCode::ACCEPTED
     } else {
+        wake(&hub, &to);
         StatusCode::NOT_FOUND
     }
 }
@@ -227,7 +281,9 @@ async fn deposit(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: H
     }
     match hub.db.deposit(&to, &body, MAILBOX_TTL).await {
         Ok(_) => {
-            notify(&hub, &to, json!({ "kind": "mail" })).await;
+            if !notify(&hub, &to, json!({ "kind": "mail" })).await {
+                wake(&hub, &to);
+            }
             StatusCode::CREATED
         }
         Err(_) => StatusCode::INSUFFICIENT_STORAGE,

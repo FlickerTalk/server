@@ -87,3 +87,19 @@ docker run -d --name ft-pg-test -e POSTGRES_PASSWORD=test -e POSTGRES_DB=ft_rout
 cargo test -p ft-router                          # desde server/
 docker build -t ft-router .                      # x86 en producción
 ```
+
+## Estado: push (2026-09-22, `§106` M4)
+
+- `PUT /v1/device/push` (`{"provider":"fcm","token":…}`) y `DELETE /v1/device/push`, firmados. El
+  token se guarda cifrado (ChaCha20-Poly1305, `push.rs`) con una clave maestra que no está en la
+  base de datos (`FT_PUSH_KEY_FILE`, secreto de Swarm, 32 bytes en base64). Migración `0002_push`.
+- Un dispositivo **no conectado** se despierta cuando le llega una señal o un correo: FCM HTTP v1,
+  mensaje de datos `{"t":"wake"}` de prioridad alta y TTL 60 s, sin remitente ni contenido. Como
+  mucho un aviso cada 10 s por dispositivo. Un token que FCM da por caducado se borra.
+- FCM con una cuenta de servicio propia (`FT_FCM_SERVICE_ACCOUNT_FILE`) que solo puede enviar
+  mensajes; el token OAuth se reutiliza hasta poco antes de caducar. Sin la clave o la cuenta, no se
+  despierta a nadie.
+- Tests: el cofre, el límite y FCM contra un Google falso que comprueba la firma RS256; en la API,
+  guardar y borrar el token, despertar por señal y por correo, no despertar a quien está conectado y
+  olvidar tokens caducados.
+

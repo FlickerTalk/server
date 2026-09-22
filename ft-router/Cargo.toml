@@ -7,23 +7,31 @@ license = "AGPL-3.0-only"
 
 [dependencies]
 anyhow = "1"
+async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 blake3 = "1"
 bs58 = "0.5"
+chacha20poly1305 = "0.10"
 ed25519-dalek = "3"
 futures-util = "0.3"
 hmac = "0.12"
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
 rand = "0.9"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "form"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.10"
 sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "migrate", "macros", "uuid"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 uuid = { version = "1.18", features = ["v7"] }
+webpki-roots = "1"
 
 [dev-dependencies]
+async-trait = "0.1"
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
+rsa = { version = "0.9", features = ["pem", "getrandom"] }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-tungstenite = "0.30"
 uuid = { version = "1.18", features = ["v7"] }
