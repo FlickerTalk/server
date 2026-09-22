@@ -75,6 +75,35 @@ impl Db {
         Ok(())
     }
 
+    /// Keeps where the device can be woken (`sealed` is already encrypted); `false` if the device
+    /// is not registered.
+    pub async fn set_push(&self, device_id: &str, provider: &str, sealed: &[u8]) -> Result<bool> {
+        let updated = sqlx::query("UPDATE devices SET push_provider = $2, push_target = $3, updated_at = now() WHERE device_id = $1")
+            .bind(device_id)
+            .bind(provider)
+            .bind(sealed)
+            .execute(&self.pool)
+            .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    pub async fn clear_push(&self, device_id: &str) -> Result<()> {
+        sqlx::query("UPDATE devices SET push_provider = NULL, push_target = NULL WHERE device_id = $1")
+            .bind(device_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The provider and the encrypted token, if the device left one.
+    pub async fn push_of(&self, device_id: &str) -> Result<Option<(String, Vec<u8>)>> {
+        let row = sqlx::query("SELECT push_provider, push_target FROM devices WHERE device_id = $1 AND push_target IS NOT NULL")
+            .bind(device_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|row| (row.get("push_provider"), row.get("push_target"))))
+    }
+
     pub async fn deposit(&self, device_id: &str, blob: &[u8], ttl: Duration) -> Result<Uuid> {
         if blob.len() > MAX_BLOB {
             bail!("the blob is too large");

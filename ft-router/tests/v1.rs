@@ -10,7 +10,8 @@ use ed25519_dalek::{Signer, SigningKey};
 use ft_router::auth::{device_id, SignedRequest};
 use ft_router::db::Db;
 use ft_router::turn::TurnIssuer;
-use ft_router::{app, Config};
+use ft_router::push::{PushVault, Wake, WakeLimiter, Waker};
+use ft_router::{app, Config, Push};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
@@ -23,21 +24,68 @@ type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 struct Router {
     base: String,
     http: reqwest::Client,
+    db: Arc<Db>,
 }
 
 async fn router() -> Router {
+    router_with(None).await
+}
+
+async fn router_with(push: Option<Arc<Push>>) -> Router {
     let url = std::env::var("FT_TEST_DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:test@127.0.0.1:55432/ft_router_test".to_owned());
-    let db = Db::connect_isolated(&url).await.expect("test database");
+    let db = Arc::new(Db::connect_isolated(&url).await.expect("test database"));
     let config = Config {
         stun: vec!["stun:turn.example:3478".to_owned()],
         turn: Some(TurnIssuer::new(b"secret".to_vec(), vec!["turn:turn.example:3478".to_owned()], Duration::from_secs(600))),
-        db: Some(Arc::new(db)),
+        db: Some(db.clone()),
+        push,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("binds");
     let address = listener.local_addr().expect("address");
     tokio::spawn(async move { axum::serve(listener, app(config)).await.expect("serves") });
-    Router { base: format!("http://{address}"), http: reqwest::Client::new() }
+    // The router's HTTP client is built without a default TLS provider (it picks ring itself).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    Router { base: format!("http://{address}"), http: reqwest::Client::new(), db }
+}
+
+/// Wakes nobody: records the tokens it was asked to wake. "gone" is an expired token.
+#[derive(Default)]
+struct FakeWaker {
+    woken: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl Waker for FakeWaker {
+    async fn wake(&self, token: &str) -> Wake {
+        self.woken.lock().unwrap().push(token.to_owned());
+        if token == "gone" {
+            Wake::Unregistered
+        } else {
+            Wake::Sent
+        }
+    }
+}
+
+impl FakeWaker {
+    fn woken(&self) -> Vec<String> {
+        self.woken.lock().unwrap().clone()
+    }
+}
+
+fn push_with(waker: Arc<FakeWaker>) -> Option<Arc<Push>> {
+    Some(Arc::new(Push { vault: PushVault::new(&[9; 32]), waker, limiter: WakeLimiter::new(Duration::from_secs(10)) }))
+}
+
+/// Waits a little for work the router does in the background.
+async fn soon<F: Fn() -> bool>(condition: F) -> bool {
+    for _ in 0..50 {
+        if condition() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    condition()
 }
 
 /// A test device: its identity key and route capability.
@@ -277,4 +325,97 @@ async fn a_device_can_forget_itself() {
     deposit(&router, &bob, bob.capability(), b"sealed".to_vec()).await;
     assert_eq!(bob.request(&router, "DELETE", "/v1/device", vec![]).await.status(), 204);
     assert_eq!(deposit(&router, &bob, bob.capability(), b"again".to_vec()).await.status(), 403);
+}
+
+impl Device {
+    async fn set_push(&self, router: &Router, token: &str) -> reqwest::Response {
+        let body = serde_json::to_vec(&json!({ "provider": "fcm", "token": token })).unwrap();
+        self.request(router, "PUT", "/v1/device/push", body).await
+    }
+}
+
+// §8–12: a device leaves where it can be woken, encrypted with a key that is not in the database.
+#[tokio::test]
+async fn a_device_leaves_its_push_token_encrypted_and_takes_it_back() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_with(waker)).await;
+    let bob = Device::new(2);
+    assert_eq!(bob.register(&router).await.status(), 204);
+    assert_eq!(bob.set_push(&router, "bob-fcm-token").await.status(), 204);
+
+    let (provider, sealed) = router.db.push_of(&bob.id()).await.unwrap().expect("stored");
+    assert_eq!(provider, "fcm");
+    assert!(!sealed.windows(7).any(|window| window == b"bob-fcm"), "never in the clear");
+    assert_eq!(PushVault::new(&[9; 32]).open(&sealed).unwrap(), "bob-fcm-token");
+
+    assert_eq!(bob.request(&router, "DELETE", "/v1/device/push", vec![]).await.status(), 204);
+    assert!(router.db.push_of(&bob.id()).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn push_tokens_must_be_sensible() {
+    let router = router_with(push_with(Arc::default())).await;
+    let bob = Device::new(2);
+    bob.register(&router).await;
+    let other = serde_json::to_vec(&json!({ "provider": "carrier-pigeon", "token": "x" })).unwrap();
+    assert_eq!(bob.request(&router, "PUT", "/v1/device/push", other).await.status(), 400);
+    assert_eq!(bob.set_push(&router, &"x".repeat(5000)).await.status(), 413);
+    let stranger = Device::new(3);
+    assert_eq!(stranger.set_push(&router, "t").await.status(), 401, "only registered devices");
+}
+
+// §12: a device that is not connected is woken when a signal or mail arrives, with nothing in the
+// push; then it connects and fetches.
+#[tokio::test]
+async fn an_offline_device_is_woken_when_signalled_or_written_to() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_with(waker.clone())).await;
+    let (alice, bob) = (Device::new(1), Device::new(2));
+    alice.register(&router).await;
+    bob.register(&router).await;
+    bob.set_push(&router, "bob-fcm-token").await;
+
+    assert_eq!(signal(&router, &bob, bob.capability(), b"offer".to_vec()).await.status(), 404, "still not delivered");
+    assert!(soon(|| waker.woken() == ["bob-fcm-token"]).await);
+
+    // Once in a while at most: mail right after does not wake again.
+    deposit(&router, &bob, bob.capability(), b"sealed".to_vec()).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(waker.woken().len(), 1);
+}
+
+#[tokio::test]
+async fn a_connected_device_is_not_woken() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_with(waker.clone())).await;
+    let (alice, bob) = (Device::new(1), Device::new(2));
+    alice.register(&router).await;
+    bob.register(&router).await;
+    bob.set_push(&router, "bob-fcm-token").await;
+    let mut socket = bob.connect(&router).await;
+    next_json(&mut socket).await;
+
+    deposit(&router, &bob, bob.capability(), b"sealed".to_vec()).await;
+    assert_eq!(next_json(&mut socket).await["kind"], "mail");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(waker.woken().is_empty());
+}
+
+// A token FCM no longer knows (the app was removed) is forgotten.
+#[tokio::test]
+async fn an_expired_push_token_is_forgotten() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_with(waker.clone())).await;
+    let bob = Device::new(2);
+    bob.register(&router).await;
+    bob.set_push(&router, "gone").await;
+    deposit(&router, &bob, bob.capability(), b"sealed".to_vec()).await;
+    assert!(soon(|| !waker.woken().is_empty()).await);
+    for _ in 0..50 {
+        if router.db.push_of(&bob.id()).await.unwrap().is_none() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the expired token is still there");
 }
