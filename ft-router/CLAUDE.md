@@ -126,3 +126,15 @@ docker build -t ft-router .                      # x86 en producción
 - El stack despliega la imagen que diga `FT_ROUTER_IMAGE` en Dokploy. Hasta que el paquete de GHCR
   sea público sigue siendo la imagen compilada en los nodos (`infra/scripts/build-router.sh`).
 
+
+## Estado: base de datos con WAL-G (2026-09-22, `§75`)
+
+- `postgres/` construye `ghcr.io/flickertalk/postgres-walg`: PostgreSQL 17 con WAL-G. Con el
+  directorio de datos vacío restaura la última copia base y reproduce el WAL; con datos, arranca y
+  sigue archivando; sin `WALG_S3_PREFIX`, es un PostgreSQL normal (así corre hasta que exista el
+  bucket). Copias base cada 24 h y solo las dos últimas (`§73`).
+- El buzón es `UNLOGGED`: no entra en el WAL ni en las copias (`§19`). Si se restaura, vuelve
+  vacío y los emisores reenvían lo pendiente (`§84`).
+- `postgres/entrypoint.test.sh` prueba las tres decisiones del arranque con `wal-g` y `postgres`
+  falseados; el CI además construye la imagen y comprueba que PostgreSQL arranca con el archivado
+  activado.

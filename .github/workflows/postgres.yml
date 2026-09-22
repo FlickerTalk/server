@@ -1,0 +1,60 @@
+# The database image of the router: PostgreSQL with WAL-G (Plan §75). Tested on every change and
+# published to GHCR on every push to main; the stack in infra pulls it.
+name: postgres
+
+on:
+  pull_request:
+    paths: [postgres/**, .github/workflows/postgres.yml]
+  push:
+    branches: [main]
+    paths: [postgres/**, .github/workflows/postgres.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: What the start script decides
+        working-directory: postgres
+        run: ./entrypoint.test.sh
+      - name: It builds and PostgreSQL starts
+        working-directory: postgres
+        run: |
+          docker build -t postgres-walg:test .
+          docker run --rm postgres-walg:test wal-g --version
+          docker run -d --name pg -e POSTGRES_PASSWORD=test postgres-walg:test
+          for _ in $(seq 1 30); do
+            sleep 2
+            docker exec pg pg_isready -U postgres && break
+          done
+          docker exec pg psql -U postgres -tAc "select current_setting('archive_mode')" | grep -qx on
+
+  image:
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v7
+        with:
+          context: postgres
+          push: true
+          tags: |
+            ghcr.io/flickertalk/postgres-walg:latest
+            ghcr.io/flickertalk/postgres-walg:sha-${{ github.sha }}
+          labels: org.opencontainers.image.source=https://github.com/FlickerTalk/server
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
