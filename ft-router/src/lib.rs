@@ -11,6 +11,7 @@
 
 pub mod auth;
 pub mod db;
+pub mod limits;
 pub mod turn;
 pub mod push;
 
@@ -51,6 +52,11 @@ pub struct Config {
     pub db: Option<Arc<Db>>,
     /// Without it, devices that are not connected are never woken.
     pub push: Option<Arc<Push>>,
+    /// The PoC 0 relay (`/poc/rooms/{room}`) forwards anything between whoever joins a room: an
+    /// open relay, so it is off unless asked for (`FT_POC_RELAY=1`).
+    pub poc_relay: bool,
+    /// Requests per device, recipient and origin (§91).
+    pub limits: limits::Limits,
 }
 
 #[derive(Clone, Default)]
@@ -64,11 +70,12 @@ pub fn app(config: Config) -> Router {
     let v1 = config
         .db
         .clone()
-        .map(|db| v1::routes(Arc::new(v1::Hub::new(db, config.stun.clone(), config.turn.clone(), config.push.clone()))));
-    let router = Router::new()
-        .route("/health", get(|| async { "ok" }))
-        .route("/poc/rooms/{room}", get(join))
-        .with_state(Rooms { config: Arc::new(config), ..Rooms::default() });
+        .map(|db| v1::routes(Arc::new(v1::Hub::new(db, config.stun.clone(), config.turn.clone(), config.push.clone(), config.limits))));
+    let mut router = Router::new().route("/health", get(|| async { "ok" }));
+    if config.poc_relay {
+        router = router.route("/poc/rooms/{room}", get(join));
+    }
+    let router = router.with_state(Rooms { config: Arc::new(config), ..Rooms::default() });
     match v1 {
         Some(v1) => router.merge(v1),
         None => router,

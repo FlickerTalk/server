@@ -13,6 +13,8 @@
 //!   encrypted (§8). A device that is not connected is woken when a signal or mail arrives for it,
 //!   with nothing in the push (§12).
 //!
+//! Requests are limited per device, per recipient and per origin (`limits.rs`, §91): 429 beyond.
+//!
 //! Nothing is logged (§71). Connections live in memory, so signalling needs a single replica
 //! until it is shared through PostgreSQL (§106).
 
@@ -34,6 +36,7 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::auth::{self, decode_base64, ReplayGuard, SignedRequest, STANDARD_NO_PAD};
 use crate::db::{Db, MAX_BLOB};
+use crate::limits::{Limiters, Limits};
 use crate::push::{Push, Wake, FCM, MAX_TOKEN};
 use crate::turn::TurnIssuer;
 
@@ -51,11 +54,29 @@ pub struct Hub {
     stun: Vec<String>,
     turn: Option<TurnIssuer>,
     push: Option<Arc<Push>>,
+    limiters: Limiters,
 }
 
 impl Hub {
-    pub fn new(db: Arc<Db>, stun: Vec<String>, turn: Option<TurnIssuer>, push: Option<Arc<Push>>) -> Self {
-        Self { db, guard: ReplayGuard::default(), online: Mutex::default(), stun, turn, push }
+    pub fn new(db: Arc<Db>, stun: Vec<String>, turn: Option<TurnIssuer>, push: Option<Arc<Push>>, limits: Limits) -> Self {
+        Self { db, guard: ReplayGuard::default(), online: Mutex::default(), stun, turn, push, limiters: Limiters::new(limits) }
+    }
+
+    /// One more request from this origin; 429 once it is over its share.
+    fn from_origin(&self, headers: &HeaderMap) -> Result<(), StatusCode> {
+        if self.limiters.origin.allow(&self.limiters.origin(headers)) {
+            Ok(())
+        } else {
+            Err(StatusCode::TOO_MANY_REQUESTS)
+        }
+    }
+
+    fn for_recipient(&self, to: &str) -> Result<(), StatusCode> {
+        if self.limiters.recipient.allow(to) {
+            Ok(())
+        } else {
+            Err(StatusCode::TOO_MANY_REQUESTS)
+        }
     }
 }
 
@@ -124,6 +145,9 @@ async fn authenticate(
     hub.guard
         .admit(&signature.device, &signature.nonce, signature.time_ms, now_ms())
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    if !hub.limiters.device.allow(&signature.device) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
     Ok(signature.device)
 }
 
@@ -152,6 +176,7 @@ struct Registration {
 }
 
 async fn register(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: Bytes) -> Result<StatusCode, StatusCode> {
+    hub.from_origin(&headers)?;
     let registration: Registration = serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
     let key = key32(&registration.signing_key)?;
     let hash = key32(&registration.capability_hash)?;
@@ -257,7 +282,13 @@ async fn notify(hub: &Hub, device: &str, message: Value) -> bool {
 }
 
 async fn signal(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: HeaderMap, body: Bytes) -> StatusCode {
+    if let Err(status) = hub.from_origin(&headers) {
+        return status;
+    }
     if let Err(status) = check_capability(&hub, &to, &headers).await {
+        return status;
+    }
+    if let Err(status) = hub.for_recipient(&to) {
         return status;
     }
     if body.len() > MAX_SIGNAL {
@@ -273,7 +304,13 @@ async fn signal(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: He
 }
 
 async fn deposit(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: HeaderMap, body: Bytes) -> StatusCode {
+    if let Err(status) = hub.from_origin(&headers) {
+        return status;
+    }
     if let Err(status) = check_capability(&hub, &to, &headers).await {
+        return status;
+    }
+    if let Err(status) = hub.for_recipient(&to) {
         return status;
     }
     if body.len() > MAX_BLOB {

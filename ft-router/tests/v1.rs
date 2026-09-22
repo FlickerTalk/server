@@ -11,6 +11,7 @@ use ft_router::auth::{device_id, SignedRequest};
 use ft_router::db::Db;
 use ft_router::turn::TurnIssuer;
 use ft_router::push::{PushVault, Wake, WakeLimiter, Waker};
+use ft_router::limits::Limits;
 use ft_router::{app, Config, Push};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -32,6 +33,14 @@ async fn router() -> Router {
 }
 
 async fn router_with(push: Option<Arc<Push>>) -> Router {
+    router_configured(push, Limits::default()).await
+}
+
+async fn router_limited(limits: Limits) -> Router {
+    router_configured(None, limits).await
+}
+
+async fn router_configured(push: Option<Arc<Push>>, limits: Limits) -> Router {
     let url = std::env::var("FT_TEST_DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:test@127.0.0.1:55432/ft_router_test".to_owned());
     let db = Arc::new(Db::connect_isolated(&url).await.expect("test database"));
@@ -40,6 +49,8 @@ async fn router_with(push: Option<Arc<Push>>) -> Router {
         turn: Some(TurnIssuer::new(b"secret".to_vec(), vec!["turn:turn.example:3478".to_owned()], Duration::from_secs(600))),
         db: Some(db.clone()),
         push,
+        poc_relay: false,
+        limits,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("binds");
     let address = listener.local_addr().expect("address");
@@ -418,4 +429,62 @@ async fn an_expired_push_token_is_forgotten() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("the expired token is still there");
+}
+
+fn limits(per_device: u32, per_recipient: u32, per_origin: u32) -> Limits {
+    Limits { per_device, per_recipient, per_origin, window: Duration::from_secs(60) }
+}
+
+// §91: each device, recipient and origin gets a fair share; beyond it, 429 until the next minute.
+#[tokio::test]
+async fn a_device_that_asks_too_often_is_told_to_slow_down() {
+    let router = router_limited(limits(4, 1000, 1000)).await;
+    let bob = Device::new(2);
+    bob.register(&router).await;
+    let mut statuses = Vec::new();
+    for _ in 0..4 {
+        statuses.push(bob.request(&router, "GET", "/v1/mailbox", vec![]).await.status().as_u16());
+    }
+    assert_eq!(statuses, [200, 200, 200, 429], "the registration counts too");
+}
+
+#[tokio::test]
+async fn a_recipient_cannot_be_flooded() {
+    let router = router_limited(limits(1000, 3, 1000)).await;
+    let (bob, carol) = (Device::new(2), Device::new(3));
+    bob.register(&router).await;
+    carol.register(&router).await;
+    for _ in 0..3 {
+        assert_eq!(deposit(&router, &bob, bob.capability(), b"x".to_vec()).await.status(), 201);
+    }
+    assert_eq!(deposit(&router, &bob, bob.capability(), b"x".to_vec()).await.status(), 429);
+    assert_eq!(signal(&router, &bob, bob.capability(), b"x".to_vec()).await.status(), 429, "signals count for the same recipient");
+    assert_eq!(deposit(&router, &carol, carol.capability(), b"x".to_vec()).await.status(), 201, "others are not affected");
+}
+
+// The origin is the address the load balancer saw (the last X-Forwarded-For), hashed in memory.
+#[tokio::test]
+async fn one_origin_cannot_register_devices_without_end() {
+    let router = router_limited(limits(1000, 1000, 2)).await;
+    let register_from = |seed: u8, origin: &'static str| {
+        let router = &router;
+        async move {
+            let device = Device::new(seed);
+            let body = serde_json::to_vec(&json!({
+                "signing_key": STANDARD_NO_PAD.encode(device.key.verifying_key().to_bytes()),
+                "capability_hash": STANDARD_NO_PAD.encode(blake3::hash(&device.capability).as_bytes()),
+            }))
+            .unwrap();
+            let nonce = format!("{}", uuid::Uuid::now_v7());
+            let mut request = router.http.post(format!("{}/v1/device/register", router.base)).body(body.clone());
+            for (name, value) in device.sign("POST", "/v1/device/register", &body, &nonce) {
+                request = request.header(name, value);
+            }
+            request.header("x-forwarded-for", format!("6.6.6.6, {origin}")).send().await.unwrap().status().as_u16()
+        }
+    };
+    assert_eq!(register_from(10, "203.0.113.7").await, 204);
+    assert_eq!(register_from(11, "203.0.113.7").await, 204);
+    assert_eq!(register_from(12, "203.0.113.7").await, 429);
+    assert_eq!(register_from(13, "198.51.100.9").await, 204, "another origin is fine");
 }
