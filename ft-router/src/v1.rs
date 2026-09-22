@@ -63,7 +63,7 @@ impl Hub {
     }
 
     /// One more request from this origin; 429 once it is over its share.
-    fn from_origin(&self, headers: &HeaderMap) -> Result<(), StatusCode> {
+    fn limit_origin(&self, headers: &HeaderMap) -> Result<(), StatusCode> {
         if self.limiters.origin.allow(&self.limiters.origin(headers)) {
             Ok(())
         } else {
@@ -71,7 +71,7 @@ impl Hub {
         }
     }
 
-    fn for_recipient(&self, to: &str) -> Result<(), StatusCode> {
+    fn limit_recipient(&self, to: &str) -> Result<(), StatusCode> {
         if self.limiters.recipient.allow(to) {
             Ok(())
         } else {
@@ -176,7 +176,7 @@ struct Registration {
 }
 
 async fn register(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: Bytes) -> Result<StatusCode, StatusCode> {
-    hub.from_origin(&headers)?;
+    hub.limit_origin(&headers)?;
     let registration: Registration = serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
     let key = key32(&registration.signing_key)?;
     let hash = key32(&registration.capability_hash)?;
@@ -282,13 +282,13 @@ async fn notify(hub: &Hub, device: &str, message: Value) -> bool {
 }
 
 async fn signal(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: HeaderMap, body: Bytes) -> StatusCode {
-    if let Err(status) = hub.from_origin(&headers) {
+    if let Err(status) = hub.limit_origin(&headers) {
         return status;
     }
     if let Err(status) = check_capability(&hub, &to, &headers).await {
         return status;
     }
-    if let Err(status) = hub.for_recipient(&to) {
+    if let Err(status) = hub.limit_recipient(&to) {
         return status;
     }
     if body.len() > MAX_SIGNAL {
@@ -304,13 +304,13 @@ async fn signal(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: He
 }
 
 async fn deposit(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: HeaderMap, body: Bytes) -> StatusCode {
-    if let Err(status) = hub.from_origin(&headers) {
+    if let Err(status) = hub.limit_origin(&headers) {
         return status;
     }
     if let Err(status) = check_capability(&hub, &to, &headers).await {
         return status;
     }
-    if let Err(status) = hub.for_recipient(&to) {
+    if let Err(status) = hub.limit_recipient(&to) {
         return status;
     }
     if body.len() > MAX_BLOB {
