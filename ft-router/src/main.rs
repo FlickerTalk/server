@@ -1,22 +1,79 @@
+use std::time::Duration;
+
+use ft_router::turn::TurnIssuer;
+use ft_router::Config;
 use tokio::net::TcpListener;
 
 const DEFAULT_ADDRESS: &str = "0.0.0.0:8787";
+
+/// TURN users last a few minutes (Plan §17).
+const TURN_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// Where to listen: `FT_ROUTER_ADDR` if set, else every interface on port 8787.
 fn listen_address(configured: Option<String>) -> String {
     configured.filter(|address| !address.is_empty()).unwrap_or_else(|| DEFAULT_ADDRESS.to_owned())
 }
 
+fn server_list(urls: Option<String>) -> Vec<String> {
+    urls.unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Our STUN and TURN servers, comma-separated, and the secret shared with coturn. Without the
+/// secret no TURN user is issued.
+fn config_from(stun: Option<String>, turn: Option<String>, secret: Option<Vec<u8>>) -> Config {
+    let turn = secret.map(|secret| {
+        let secret = secret.trim_ascii_end().to_vec();
+        TurnIssuer::new(secret, server_list(turn), TURN_TTL)
+    });
+    Config { stun: server_list(stun), turn }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let listener = TcpListener::bind(listen_address(std::env::var("FT_ROUTER_ADDR").ok())).await?;
-    axum::serve(listener, ft_router::app()).await?;
+    let variable = |name: &str| std::env::var(name).ok();
+    let secret = variable("FT_TURN_SECRET_FILE").map(std::fs::read).transpose()?;
+    let config = config_from(variable("FT_STUN_URLS"), variable("FT_TURN_URLS"), secret);
+
+    let listener = TcpListener::bind(listen_address(variable("FT_ROUTER_ADDR"))).await?;
+    axum::serve(listener, ft_router::app(config)).await?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+
+    use ft_router::turn::credential_for;
+
     use super::*;
+
+    #[test]
+    fn without_a_turn_secret_only_stun_is_offered() {
+        let config = config_from(Some("stun:a:3478".to_owned()), Some("turn:a:3478".to_owned()), None);
+        assert_eq!(config.stun, ["stun:a:3478"]);
+        assert!(config.turn.is_none());
+    }
+
+    #[test]
+    fn server_lists_are_comma_separated() {
+        let config = config_from(Some("stun:a:3478, stun:b:3478".to_owned()), None, None);
+        assert_eq!(config.stun, ["stun:a:3478", "stun:b:3478"]);
+        assert!(config_from(None, None, None).stun.is_empty());
+    }
+
+    // Swarm secrets are files; the trailing newline is not part of the secret.
+    #[test]
+    fn turn_users_are_signed_with_the_secret_file_contents() {
+        let config = config_from(None, Some("turn:a:3478".to_owned()), Some(b"abc\n".to_vec()));
+        let issued = config.turn.expect("TURN is configured").issue(SystemTime::now());
+        assert_eq!(issued.urls, ["turn:a:3478"]);
+        assert_eq!(issued.credential, credential_for(b"abc", &issued.username));
+    }
 
     #[test]
     fn listens_on_port_8787_unless_told_otherwise() {
