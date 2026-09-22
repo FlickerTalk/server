@@ -35,7 +35,7 @@ fn config_from(stun: Option<String>, turn: Option<String>, secret: Option<Vec<u8
         let secret = secret.trim_ascii_end().to_vec();
         TurnIssuer::new(secret, server_list(turn), TURN_TTL)
     });
-    Config { stun: server_list(stun), turn, db: None, push: None }
+    Config { stun: server_list(stun), turn, ..Config::default() }
 }
 
 /// `FT_DATABASE_URL`, or the contents of the file named by `FT_DATABASE_URL_FILE`.
@@ -78,6 +78,7 @@ async fn main() -> anyhow::Result<()> {
         config.db = Some(db);
     }
 
+    config.poc_relay = variable("FT_POC_RELAY").as_deref() == Some("1");
     let push_key = variable("FT_PUSH_KEY_FILE").map(std::fs::read).transpose()?;
     let service_account = variable("FT_FCM_SERVICE_ACCOUNT_FILE").map(std::fs::read).transpose()?;
     config.push = push_from(push_key, service_account)?.map(Arc::new);

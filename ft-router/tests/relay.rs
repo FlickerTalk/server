@@ -21,7 +21,7 @@ async fn start_relay_with(config: Config) -> String {
 }
 
 async fn start_relay() -> String {
-    start_relay_with(Config::default()).await
+    start_relay_with(Config { poc_relay: true, ..Config::default() }).await
 }
 
 async fn join_raw(base: &str, room: &str) -> Client {
@@ -68,6 +68,7 @@ async fn welcomes_each_peer_with_the_stun_servers_and_a_temporary_turn_user() {
             vec!["turn:turn.example:3478".to_owned()],
             Duration::from_secs(600),
         )),
+        poc_relay: true,
         ..Config::default()
     };
     let base = start_relay_with(config).await;
@@ -130,4 +131,11 @@ async fn keeps_rooms_apart() {
     first.send(Message::Text("hello".into())).await.expect("sends");
 
     assert_eq!(next_text(&mut stranger).await, None);
+}
+
+// The PoC relay forwards anything between whoever joins a room: an open relay. Off unless asked.
+#[tokio::test]
+async fn the_poc_relay_is_off_by_default() {
+    let base = start_relay_with(Config::default()).await;
+    assert!(tokio_tungstenite::connect_async(format!("{base}/poc/rooms/demo")).await.is_err());
 }

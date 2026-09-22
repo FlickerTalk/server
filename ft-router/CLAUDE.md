@@ -103,3 +103,12 @@ docker build -t ft-router .                      # x86 en producción
   guardar y borrar el token, despertar por señal y por correo, no despertar a quien está conectado y
   olvidar tokens caducados.
 
+## Estado: producción (2026-09-22)
+
+- **Límites** (`limits.rs`, `§91`): por ventana de 60 s, 600 peticiones firmadas por dispositivo,
+  240 señales y correos por destinatario y 1200 registros, señales y correos por origen; por encima,
+  429. Todo en memoria y sin logs. El origen es la última dirección de `X-Forwarded-For` (la que
+  añade el balanceador de Hetzner; las anteriores las pone el cliente), guardada como hash con una
+  sal nueva en cada arranque: ni en memoria hay IPs en claro.
+- **Relay del PoC 0** apagado por defecto (era un relé abierto); solo con `FT_POC_RELAY=1`.
+
