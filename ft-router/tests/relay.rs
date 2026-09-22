@@ -51,11 +51,29 @@ async fn status_of(base: &str, path: &str) -> u16 {
     response.split_whitespace().nth(1).and_then(|code| code.parse().ok()).expect("a status line")
 }
 
+/// Body of a plain HTTP GET.
+async fn body_of(base: &str, path: &str) -> String {
+    let address = base.trim_start_matches("ws://");
+    let mut stream = TcpStream::connect(address).await.expect("connects");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.expect("sends the request");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.expect("reads the response");
+    response.split_once("\r\n\r\n").map(|(_, body)| body.to_owned()).expect("a body")
+}
+
 // The load balancer's health check (Plan §75).
 #[tokio::test]
 async fn answers_the_health_check() {
     let base = start_relay().await;
     assert_eq!(status_of(&base, "/health").await, 200);
+}
+
+// A deploy waits until the new version answers (the old one serves during the rolling update).
+#[tokio::test]
+async fn tells_which_version_is_running() {
+    let base = start_relay().await;
+    assert_eq!(body_of(&base, "/version").await, env!("CARGO_PKG_VERSION"));
 }
 
 // Plan §16–17: our STUN first, and a temporary TURN user for this session only.

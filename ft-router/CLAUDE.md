@@ -111,4 +111,18 @@ docker build -t ft-router .                      # x86 en producción
   añade el balanceador de Hetzner; las anteriores las pone el cliente), guardada como hash con una
   sal nueva en cada arranque: ni en memoria hay IPs en claro.
 - **Relay del PoC 0** apagado por defecto (era un relé abierto); solo con `FT_POC_RELAY=1`.
+- `GET /version` responde la versión del crate. El despliegue la usa para saber cuándo sirve la
+  nueva versión, porque durante la actualización progresiva `/health` lo sigue contestando la vieja.
+
+## CI/CD (`.github/workflows/router.yml`, Plan `§105`)
+
+- Cada PR pasa clippy y los tests con PostgreSQL.
+- Cada push a `main` publica la imagen `ghcr.io/flickertalk/ft-router:canary`, que no se despliega.
+- Cada tag `vX.Y.Z` (igual a `version` en `ft-router/Cargo.toml`):
+  1. publica `:vX.Y.Z` y `:latest`;
+  2. llama al webhook de Dokploy del stack del router, que solo puede redesplegar ese stack
+     (secreto `DOKPLOY_ROUTER_WEBHOOK` del entorno `production`, solo para tags `v*`);
+  3. espera hasta 5 minutos a que `api.flickertalk.com/version` responda la versión nueva.
+- El stack despliega la imagen que diga `FT_ROUTER_IMAGE` en Dokploy. Hasta que el paquete de GHCR
+  sea público sigue siendo la imagen compilada en los nodos (`infra/scripts/build-router.sh`).
 
