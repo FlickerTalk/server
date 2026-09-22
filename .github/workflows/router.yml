@@ -1,15 +1,29 @@
-# Tests ft-router and publishes its image to GHCR, from where the servers pull it. Deploying is
-# a separate, manual step for now.
+# Tests ft-router on every change and publishes its image to GHCR: every push to main as
+# `canary`, every version tag (vX.Y.Z) as that version and `latest`, which then goes to production
+# (Plan §105).
+#
+# Deploying calls the router's own Dokploy webhook, which can only redeploy that stack; it lives in
+# the `production` environment, which only v* tags can use. The stack runs `FT_ROUTER_IMAGE`, set
+# in Dokploy.
 name: router
 
 on:
+  pull_request:
   push:
     branches: [main]
-  pull_request:
+    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: router-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  IMAGE: ghcr.io/flickertalk/ft-router
 
 jobs:
   test:
@@ -29,33 +43,68 @@ jobs:
           --health-timeout 5s
           --health-retries 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
 
   image:
     needs: test
-    if: github.event_name != 'pull_request'
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@v7
+      - id: tags
+        name: Tags (a version tag must match ft-router's Cargo.toml)
+        run: |
+          version=$(grep -m1 '^version' ft-router/Cargo.toml | cut -d'"' -f2)
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match version $version in ft-router/Cargo.toml"
+              exit 1
+            fi
+            echo "tags=$IMAGE:$GITHUB_REF_NAME,$IMAGE:latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "tags=$IMAGE:canary,$IMAGE:sha-$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           push: true
-          tags: |
-            ghcr.io/flickertalk/ft-router:latest
-            ghcr.io/flickertalk/ft-router:${{ github.sha }}
+          tags: ${{ steps.tags.outputs.tags }}
           labels: org.opencontainers.image.source=https://github.com/FlickerTalk/server
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  deploy:
+    needs: image
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Redeploy the router stack
+        env:
+          WEBHOOK: ${{ secrets.DOKPLOY_ROUTER_WEBHOOK }}
+        run: curl -fsS -X POST "$WEBHOOK" -o /dev/null
+      - name: Wait until the new version answers
+        run: |
+          want="${GITHUB_REF_NAME#v}"
+          for _ in $(seq 1 60); do
+            sleep 5
+            if [[ "$(curl -fsS https://api.flickertalk.com/version || true)" == "$want" ]]; then exit 0; fi
+          done
+          echo "::error::api.flickertalk.com does not answer $want after 5 minutes"
+          exit 1
