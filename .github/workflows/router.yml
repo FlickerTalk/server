@@ -1,0 +1,47 @@
+# Tests ft-router and publishes its image to GHCR, from where the servers pull it. Deploying is
+# a separate, manual step for now.
+name: router
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+
+  image:
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/flickertalk/ft-router:latest
+            ghcr.io/flickertalk/ft-router:${{ github.sha }}
+          labels: org.opencontainers.image.source=https://github.com/FlickerTalk/server
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

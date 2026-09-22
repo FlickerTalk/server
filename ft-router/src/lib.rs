@@ -5,10 +5,16 @@
 //! through push (§13); this relay is temporary and exists to test WebRTC between devices.
 //!
 //! Nothing is stored or logged: rooms live in memory and disappear with their last peer (§71).
+//!
+//! Every peer first gets a welcome with the ICE servers to use: our STUN and, if configured, a
+//! temporary TURN user for that session only (§16–17).
+
+pub mod turn;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
@@ -17,6 +23,8 @@ use axum::routing::get;
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, Mutex};
+
+use crate::turn::TurnIssuer;
 
 /// Sent to a newcomer when someone is already in the room.
 pub const PEER_PRESENT: &str = r#"{"kind":"peer_present"}"#;
@@ -27,23 +35,40 @@ pub const PEER_LEFT: &str = r#"{"kind":"peer_left"}"#;
 
 type Outbox = mpsc::UnboundedSender<String>;
 
+/// The ICE servers handed to every peer.
+#[derive(Clone, Default)]
+pub struct Config {
+    pub stun: Vec<String>,
+    pub turn: Option<TurnIssuer>,
+}
+
 #[derive(Clone, Default)]
 struct Rooms {
     peers: Arc<Mutex<HashMap<String, HashMap<u64, Outbox>>>>,
     next_id: Arc<AtomicU64>,
+    config: Arc<Config>,
 }
 
-pub fn app() -> Router {
-    Router::new().route("/poc/rooms/{room}", get(join)).with_state(Rooms::default())
+pub fn app(config: Config) -> Router {
+    Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .route("/poc/rooms/{room}", get(join))
+        .with_state(Rooms { config: Arc::new(config), ..Rooms::default() })
 }
 
 async fn join(socket: WebSocketUpgrade, Path(room): Path<String>, State(rooms): State<Rooms>) -> Response {
     socket.on_upgrade(move |socket| relay(socket, room, rooms))
 }
 
+fn welcome(config: &Config) -> String {
+    let turn = config.turn.as_ref().map(|issuer| issuer.issue(SystemTime::now()));
+    serde_json::json!({ "kind": "welcome", "stun": config.stun, "turn": turn }).to_string()
+}
+
 async fn relay(socket: WebSocket, room: String, rooms: Rooms) {
     let id = rooms.next_id.fetch_add(1, Ordering::Relaxed);
     let (outbox, mut pending) = mpsc::unbounded_channel::<String>();
+    let _ = outbox.send(welcome(&rooms.config));
 
     {
         let mut all = rooms.peers.lock().await;

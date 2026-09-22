@@ -63,10 +63,22 @@ Ficheros y llamadas nunca pasan por el buzón (`§62`, `§66`).
 
 De momento solo existe el relay de señalización del PoC (`§87`): WebSocket en
 `/poc/rooms/{room}` que reenvía el texto entre los pares de una sala y avisa de quién entra y sale.
-En memoria, sin guardar ni registrar nada. Es temporal: la señalización real irá por push.
+En memoria, sin guardar ni registrar nada. Es temporal: la señalización real irá por push. Como
+las salas viven en memoria, el relay corre con **una réplica**.
+
+- Lo primero que recibe cada par es una bienvenida:
+  `{"kind":"welcome","stun":[…],"turn":{"urls":[…],"username":"<caducidad>:<aleatorio>","credential":"…"}}`
+  (`turn: null` sin secreto configurado). Las credenciales las firma `turn::TurnIssuer`, que servirá
+  también para `GET /v1/turn-credentials`.
+- `GET /health` → `200 ok`, para las comprobaciones del balanceador.
+- Configuración por entorno: `FT_ROUTER_ADDR` (por defecto `0.0.0.0:8787`), `FT_STUN_URLS` y
+  `FT_TURN_URLS` (separadas por comas) y `FT_TURN_SECRET_FILE` (el secret de Swarm compartido
+  con coturn; sin él no se emiten usuarios TURN).
+- Imagen: `Dockerfile` en `server/` (binario sobre distroless, sin shell, usuario sin
+  privilegios, ~26 MB).
 
 ```sh
 cargo test -p ft-router        # desde server/
-cargo run -p ft-router         # escucha en 0.0.0.0:8787 (FT_ROUTER_ADDR para cambiarlo)
+cargo run -p ft-router         # escucha en 0.0.0.0:8787
+docker build -t ft-router .    # desde server/ (x86 en producción)
 ```
-
