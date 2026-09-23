@@ -94,8 +94,13 @@ docker build -t ft-router .                      # x86 en producción
   token se guarda cifrado (ChaCha20-Poly1305, `push.rs`) con una clave maestra que no está en la
   base de datos (`FT_PUSH_KEY_FILE`, secreto de Swarm, 32 bytes en base64). Migración `0002_push`.
 - Un dispositivo **no conectado** se despierta cuando le llega una señal o un correo: FCM HTTP v1,
-  mensaje de datos `{"t":"wake"}` de prioridad alta y TTL 60 s, sin remitente ni contenido. Como
-  mucho un aviso cada 10 s por dispositivo. Un token que FCM da por caducado se borra.
+  mensaje de datos `{"t":"wake","s":"N"}` de prioridad alta y TTL 60 s, sin remitente ni contenido;
+  `s` dice cuál de sus capacidades se usó (0–7, issue app#9). Como mucho un aviso cada 10 s por
+  dispositivo y capacidad.
+- **Ocho capacidades** (issue app#9, migración `0003_capabilities`): el registro puede traer
+  `capability_hashes` con exactamente 8 hashes; la primera es la del dispositivo
+  (`devices.capability_hash`). La app registra siempre 8, casi todas de relleno, para que el router
+  no sepa cuántas sesiones ocultas hay. Un registro sin la lista (apps anteriores) sigue valiendo. Un token que FCM da por caducado se borra.
 - FCM con una cuenta de servicio propia (`FT_FCM_SERVICE_ACCOUNT_FILE`) que solo puede enviar
   mensajes; el token OAuth se reutiliza hasta poco antes de caducar. Sin la clave o la cuenta, no se
   despierta a nadie.

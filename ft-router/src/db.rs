@@ -62,10 +62,37 @@ impl Db {
         .transpose()
     }
 
-    /// Whether `capability` is the one the device registered (§34).
-    pub async fn capability_matches(&self, device_id: &str, capability: &[u8; 32]) -> Result<bool> {
+    /// Which of the device's capabilities `capability` is, if any (§34): 0 is its own, 1–7 the
+    /// others it registered (app#9).
+    pub async fn capability_slot(&self, device_id: &str, capability: &[u8; 32]) -> Result<Option<u8>> {
+        let hash = blake3::hash(capability);
         let row = sqlx::query("SELECT capability_hash FROM devices WHERE device_id = $1").bind(device_id).fetch_optional(&self.pool).await?;
-        Ok(row.is_some_and(|row| row.get::<Vec<u8>, _>("capability_hash") == blake3::hash(capability).as_bytes()))
+        let Some(row) = row else { return Ok(None) };
+        if row.get::<Vec<u8>, _>("capability_hash") == hash.as_bytes() {
+            return Ok(Some(0));
+        }
+        let slot = sqlx::query("SELECT slot FROM capabilities WHERE device_id = $1 AND capability_hash = $2")
+            .bind(device_id)
+            .bind(hash.as_bytes().as_slice())
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(slot.map(|row| row.get::<i16, _>("slot") as u8))
+    }
+
+    /// Replaces the device's eight capabilities (app#9); the first is also its own.
+    pub async fn set_capabilities(&self, device_id: &str, hashes: &[[u8; 32]; 8]) -> Result<()> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("DELETE FROM capabilities WHERE device_id = $1").bind(device_id).execute(&mut *transaction).await?;
+        for (slot, hash) in hashes.iter().enumerate() {
+            sqlx::query("INSERT INTO capabilities (device_id, slot, capability_hash) VALUES ($1, $2, $3)")
+                .bind(device_id)
+                .bind(slot as i16)
+                .bind(hash.as_slice())
+                .execute(&mut *transaction)
+                .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
     }
 
     /// Removes the device and everything waiting for it (`DELETE /v1/device`).
@@ -191,17 +218,17 @@ mod tests {
         db.register("ft_a", &KEY, &capability_hash()).await.expect("registers");
         let other = [3; 32];
         db.register("ft_a", &KEY, blake3::hash(&other).as_bytes()).await.expect("re-registers");
-        assert!(db.capability_matches("ft_a", &other).await.unwrap());
-        assert!(!db.capability_matches("ft_a", &CAPABILITY).await.unwrap());
+        assert!(db.capability_slot("ft_a", &other).await.unwrap().is_some());
+        assert!(db.capability_slot("ft_a", &CAPABILITY).await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn only_the_right_capability_opens_the_route() {
         let db = db().await;
         db.register("ft_a", &KEY, &capability_hash()).await.expect("registers");
-        assert!(db.capability_matches("ft_a", &CAPABILITY).await.unwrap());
-        assert!(!db.capability_matches("ft_a", &[9; 32]).await.unwrap());
-        assert!(!db.capability_matches("ft_unknown", &CAPABILITY).await.unwrap());
+        assert!(db.capability_slot("ft_a", &CAPABILITY).await.unwrap().is_some());
+        assert!(db.capability_slot("ft_a", &[9; 32]).await.unwrap().is_none());
+        assert!(db.capability_slot("ft_unknown", &CAPABILITY).await.unwrap().is_none());
     }
 
     #[tokio::test]

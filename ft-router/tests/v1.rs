@@ -64,12 +64,14 @@ async fn router_configured(push: Option<Arc<Push>>, limits: Limits) -> Router {
 #[derive(Default)]
 struct FakeWaker {
     woken: std::sync::Mutex<Vec<String>>,
+    slots: std::sync::Mutex<Vec<u8>>,
 }
 
 #[async_trait::async_trait]
 impl Waker for FakeWaker {
-    async fn wake(&self, token: &str) -> Wake {
+    async fn wake(&self, token: &str, slot: u8) -> Wake {
         self.woken.lock().unwrap().push(token.to_owned());
+        self.slots.lock().unwrap().push(slot);
         if token == "gone" {
             Wake::Unregistered
         } else {
@@ -81,6 +83,10 @@ impl Waker for FakeWaker {
 impl FakeWaker {
     fn woken(&self) -> Vec<String> {
         self.woken.lock().unwrap().clone()
+    }
+
+    fn slots(&self) -> Vec<u8> {
+        self.slots.lock().unwrap().clone()
     }
 }
 
@@ -488,3 +494,77 @@ async fn one_origin_cannot_register_devices_without_end() {
     assert_eq!(register_from(12, "203.0.113.7").await, 429);
     assert_eq!(register_from(13, "198.51.100.9").await, 204, "another origin is fine");
 }
+
+/// Hidden sessions, phase 2 (app#9): a device registers eight capabilities, always eight, so the
+/// router cannot tell how many are real. Its own is the first.
+fn eight(device: &Device) -> Vec<[u8; 32]> {
+    (0..8u8).map(|slot| if slot == 0 { device.capability } else { [slot; 32] }).collect()
+}
+
+impl Device {
+    async fn register_eight(&self, router: &Router) -> reqwest::Response {
+        let hashes: Vec<String> =
+            eight(self).iter().map(|capability| STANDARD_NO_PAD.encode(blake3::hash(capability).as_bytes())).collect();
+        let body = json!({
+            "signing_key": STANDARD_NO_PAD.encode(self.key.verifying_key().to_bytes()),
+            "capability_hash": hashes[0],
+            "capability_hashes": hashes,
+        });
+        self.request(router, "POST", "/v1/device/register", serde_json::to_vec(&body).unwrap()).await
+    }
+}
+
+#[tokio::test]
+async fn any_of_the_eight_capabilities_reaches_the_device() {
+    let router = router().await;
+    let bob = Device::new(2);
+    assert_eq!(bob.register_eight(&router).await.status(), 204);
+    for capability in eight(&bob) {
+        let status = deposit(&router, &bob, STANDARD_NO_PAD.encode(capability), b"sealed".to_vec()).await.status();
+        assert_eq!(status, 201);
+    }
+    assert_eq!(deposit(&router, &bob, STANDARD_NO_PAD.encode([99u8; 32]), b"x".to_vec()).await.status(), 403);
+}
+
+#[tokio::test]
+async fn capabilities_come_eight_at_a_time_or_not_at_all() {
+    let router = router().await;
+    let bob = Device::new(2);
+    let hash = STANDARD_NO_PAD.encode(blake3::hash(&bob.capability).as_bytes());
+    let body = json!({
+        "signing_key": STANDARD_NO_PAD.encode(bob.key.verifying_key().to_bytes()),
+        "capability_hash": hash,
+        "capability_hashes": [hash, hash],
+    });
+    let status = bob.request(&router, "POST", "/v1/device/register", serde_json::to_vec(&body).unwrap()).await.status();
+    assert_eq!(status, 400);
+}
+
+// The wake says which capability was used, and nothing else: the phone knows what it means.
+#[tokio::test]
+async fn the_wake_up_says_which_capability_was_used() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_with(waker.clone())).await;
+    let bob = Device::new(2);
+    bob.register_eight(&router).await;
+    bob.set_push(&router, "bob-fcm-token").await;
+
+    deposit(&router, &bob, STANDARD_NO_PAD.encode([3u8; 32]), b"sealed".to_vec()).await;
+    assert!(soon(|| waker.slots() == [3]).await);
+    // A quiet slot never holds back the main one: each has its own pace.
+    deposit(&router, &bob, bob.capability(), b"sealed".to_vec()).await;
+    assert!(soon(|| waker.slots() == [3, 0]).await);
+}
+
+// An app from before registers one capability, as ever: it is the first.
+#[tokio::test]
+async fn a_single_capability_is_still_the_first() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_with(waker.clone())).await;
+    let bob = Device::new(2);
+    bob.register(&router).await;
+    bob.set_push(&router, "bob-fcm-token").await;
+    deposit(&router, &bob, bob.capability(), b"sealed".to_vec()).await;
+    assert!(soon(|| waker.slots() == [0]).await);
+}
+

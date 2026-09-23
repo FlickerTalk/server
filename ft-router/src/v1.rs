@@ -151,16 +151,17 @@ async fn authenticate(
     Ok(signature.device)
 }
 
-/// The recipient's route capability must come with anything addressed to it (§34).
-async fn check_capability(hub: &Hub, to: &str, headers: &HeaderMap) -> Result<(), StatusCode> {
+/// The recipient's route capability must come with anything addressed to it (§34). Returns which
+/// of its capabilities it was (app#9).
+async fn check_capability(hub: &Hub, to: &str, headers: &HeaderMap) -> Result<u8, StatusCode> {
     let capability = headers.get("ft-capability").and_then(|value| value.to_str().ok()).ok_or(StatusCode::FORBIDDEN)?;
     let capability: [u8; 32] = decode_base64(capability)
         .ok()
         .and_then(|bytes| bytes.try_into().ok())
         .ok_or(StatusCode::FORBIDDEN)?;
-    match hub.db.capability_matches(to, &capability).await {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(StatusCode::FORBIDDEN),
+    match hub.db.capability_slot(to, &capability).await {
+        Ok(Some(slot)) => Ok(slot),
+        Ok(None) => Err(StatusCode::FORBIDDEN),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
@@ -173,6 +174,9 @@ fn key32(text: &str) -> Result<[u8; 32], StatusCode> {
 struct Registration {
     signing_key: String,
     capability_hash: String,
+    /// Eight capabilities, always eight (app#9); apps from before send only the one above.
+    #[serde(default)]
+    capability_hashes: Option<Vec<String>>,
 }
 
 async fn register(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: Bytes) -> Result<StatusCode, StatusCode> {
@@ -180,9 +184,20 @@ async fn register(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: Bytes) 
     let registration: Registration = serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
     let key = key32(&registration.signing_key)?;
     let hash = key32(&registration.capability_hash)?;
+    let eight = match &registration.capability_hashes {
+        Some(hashes) if hashes.len() == 8 => {
+            let hashes: Vec<[u8; 32]> = hashes.iter().map(|hash| key32(hash)).collect::<Result<_, _>>()?;
+            Some(<[[u8; 32]; 8]>::try_from(hashes).map_err(|_| StatusCode::BAD_REQUEST)?)
+        }
+        Some(_) => return Err(StatusCode::BAD_REQUEST),
+        None => None,
+    };
     let device =
         authenticate(&hub, "POST", "/v1/device/register", Signature::from_headers(&headers), &body, Some(key)).await?;
     hub.db.register(&device, &key, &hash).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if let Some(eight) = eight {
+        hub.db.set_capabilities(&device, &eight).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -225,16 +240,17 @@ async fn clear_push(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Result<S
 
 /// Wakes a device that is not connected, in the background and at most once in a while. A token
 /// the provider no longer knows is forgotten.
-fn wake(hub: &Arc<Hub>, device: &str) {
+fn wake(hub: &Arc<Hub>, device: &str, slot: u8) {
     let Some(push) = hub.push.clone() else { return };
-    if !push.limiter.allow(device) {
+    // Each capability has its own pace: a quiet one never holds back the device's own (app#9).
+    if !push.limiter.allow(&format!("{device}/{slot}")) {
         return;
     }
     let (hub, device) = (hub.clone(), device.to_owned());
     tokio::spawn(async move {
         let Ok(Some((_, sealed))) = hub.db.push_of(&device).await else { return };
         let Ok(token) = push.vault.open(&sealed) else { return };
-        if push.waker.wake(&token).await == Wake::Unregistered {
+        if push.waker.wake(&token, slot).await == Wake::Unregistered {
             let _ = hub.db.clear_push(&device).await;
         }
     });
@@ -285,9 +301,10 @@ async fn signal(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: He
     if let Err(status) = hub.limit_origin(&headers) {
         return status;
     }
-    if let Err(status) = check_capability(&hub, &to, &headers).await {
-        return status;
-    }
+    let slot = match check_capability(&hub, &to, &headers).await {
+        Ok(slot) => slot,
+        Err(status) => return status,
+    };
     if let Err(status) = hub.limit_recipient(&to) {
         return status;
     }
@@ -298,7 +315,7 @@ async fn signal(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: He
     if notify(&hub, &to, message).await {
         StatusCode::ACCEPTED
     } else {
-        wake(&hub, &to);
+        wake(&hub, &to, slot);
         StatusCode::NOT_FOUND
     }
 }
@@ -307,9 +324,10 @@ async fn deposit(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: H
     if let Err(status) = hub.limit_origin(&headers) {
         return status;
     }
-    if let Err(status) = check_capability(&hub, &to, &headers).await {
-        return status;
-    }
+    let slot = match check_capability(&hub, &to, &headers).await {
+        Ok(slot) => slot,
+        Err(status) => return status,
+    };
     if let Err(status) = hub.limit_recipient(&to) {
         return status;
     }
@@ -319,7 +337,7 @@ async fn deposit(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: H
     match hub.db.deposit(&to, &body, MAILBOX_TTL).await {
         Ok(_) => {
             if !notify(&hub, &to, json!({ "kind": "mail" })).await {
-                wake(&hub, &to);
+                wake(&hub, &to, slot);
             }
             StatusCode::CREATED
         }

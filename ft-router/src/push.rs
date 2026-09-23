@@ -63,7 +63,8 @@ pub enum Wake {
 
 #[async_trait]
 pub trait Waker: Send + Sync {
-    async fn wake(&self, token: &str) -> Wake;
+    /// Wakes the device, saying which of its capabilities was used (0–7, app#9) and nothing else.
+    async fn wake(&self, token: &str, slot: u8) -> Wake;
 }
 
 /// Lets a device be woken at most once every `every`.
@@ -177,13 +178,14 @@ impl Fcm {
 
 #[async_trait]
 impl Waker for Fcm {
-    async fn wake(&self, token: &str) -> Wake {
+    async fn wake(&self, token: &str, slot: u8) -> Wake {
         let Ok(access) = self.access_token().await else { return Wake::Failed };
         // Data only, high priority, short-lived: the app wakes and fetches; nothing to read here.
         let message = serde_json::json!({
             "message": {
                 "token": token,
-                "data": { "t": "wake" },
+                // Which capability was used: the phone stays quiet for a closed hidden session.
+                "data": { "t": "wake", "s": slot.to_string() },
                 "android": { "priority": "high", "ttl": "60s" }
             }
         });
@@ -293,14 +295,14 @@ mod tests {
     }
 
     // FCM HTTP v1: a signed service-account assertion buys an access token, reused while valid;
-    // the message only says "wake".
+    // the message only says "wake" and which capability was used.
     #[tokio::test]
     async fn fcm_wakes_with_an_empty_message() {
         let (base, google, private_pem) = fake_google().await;
         let fcm = Fcm::with_endpoint(account(&base, private_pem), &base).unwrap();
 
-        assert_eq!(fcm.wake("device-token").await, Wake::Sent);
-        assert_eq!(fcm.wake("device-token").await, Wake::Sent);
+        assert_eq!(fcm.wake("device-token", 0).await, Wake::Sent);
+        assert_eq!(fcm.wake("device-token", 0).await, Wake::Sent);
 
         let assertions = google.seen.assertions.lock().unwrap().clone();
         assert_eq!(assertions.len(), 1, "the access token is reused");
@@ -317,7 +319,8 @@ mod tests {
         let messages = google.seen.messages.lock().unwrap().clone();
         assert_eq!(messages[0].0, "Bearer access-1");
         assert_eq!(messages[0].1["message"]["token"], "device-token");
-        assert_eq!(messages[0].1["message"]["data"], serde_json::json!({ "t": "wake" }));
+        // Besides "wake", only which of the eight capabilities was used (app#9): no sender, no content.
+        assert_eq!(messages[0].1["message"]["data"], serde_json::json!({ "t": "wake", "s": "0" }));
         assert!(messages[0].1["message"].get("notification").is_none(), "nothing to show, nothing to read");
     }
 
@@ -325,6 +328,6 @@ mod tests {
     async fn fcm_tells_when_a_token_is_gone() {
         let (base, _, private_pem) = fake_google().await;
         let fcm = Fcm::with_endpoint(account(&base, private_pem), &base).unwrap();
-        assert_eq!(fcm.wake("gone").await, Wake::Unregistered);
+        assert_eq!(fcm.wake("gone", 0).await, Wake::Unregistered);
     }
 }
