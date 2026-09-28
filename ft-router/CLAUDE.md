@@ -166,5 +166,7 @@ docker build -t ft-router .                      # x86 en producción
   de despertarlo. Es lo único que el router aprende: que es una llamada, no quién llama ni si es
   de voz o de vídeo. En APNs, si el iPhone dio su token de PushKit (`…:<token>:<voip>`), se
   manda un push VoIP (tema `bundle.voip`, `apns-expiration: 0`, cuerpo `{t: call, s}`) para que
-  suene CallKit; si no, una notificación visible `FT_INCOMING_CALL`. En FCM, `ring` es un
-  `wake`: Android ya suena solo al despertar.
+  suene CallKit; si no, una notificación visible `FT_INCOMING_CALL`. En FCM (0.3.1), `ring`
+  manda `{"t":"call","s":"N"}` con TTL 45 s, lo que suena el que llama. Antes era un `wake` y,
+  con la app cerrada, Android solo enseñaba «algo nuevo» y la llamada acababa en «No disponible»
+  (probado en un Samsung, 2026-09-28).
