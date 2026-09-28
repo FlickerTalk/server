@@ -4,7 +4,7 @@ use std::time::Duration;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use ft_router::db::Db;
-use ft_router::push::{Fcm, PushVault, ServiceAccount, WakeLimiter, WAKE_EVERY};
+use ft_router::push::{Apns, Fcm, PushVault, ServiceAccount, Waker, WakeLimiter, APNS, FCM, WAKE_EVERY};
 use ft_router::turn::TurnIssuer;
 use ft_router::{Config, Push};
 use tokio::net::TcpListener;
@@ -43,17 +43,44 @@ fn database_url(variable: Option<String>, file: Option<Vec<u8>>) -> Option<Strin
     variable.or_else(|| file.map(|bytes| String::from_utf8_lossy(bytes.trim_ascii_end()).into_owned()))
 }
 
-/// Push wake-ups (§8–12): the master key that encrypts push tokens (base64 of 32 bytes) and the
-/// FCM service account key, both from Swarm secrets. Without either, devices are never woken.
-fn push_from(key: Option<Vec<u8>>, service_account: Option<Vec<u8>>) -> anyhow::Result<Option<Push>> {
-    let (Some(key), Some(account)) = (key, service_account) else { return Ok(None) };
+/// What APNs needs (2026-09-28): the team's .p8 key (a Swarm secret), its id, the team id and
+/// the apps it may push to.
+struct ApnsSetup {
+    key: Vec<u8>,
+    key_id: String,
+    team: String,
+    topics: Vec<String>,
+}
+
+/// The apps an iPhone may register for: ours, the App Store one and the development one.
+fn topics_from(variable: Option<String>) -> Vec<String> {
+    let listed = variable.unwrap_or_else(|| "com.flickertalk.app,com.flickertalk.app.dev".to_owned());
+    listed.split(',').map(str::trim).filter(|topic| !topic.is_empty()).map(str::to_owned).collect()
+}
+
+/// Push wake-ups (§8–12): the master key that encrypts push tokens (base64 of 32 bytes), and who
+/// wakes each kind of phone: FCM with its service account key, APNs with the team's .p8 key.
+/// Without the master key, or without either provider, devices are never woken.
+fn push_from(key: Option<Vec<u8>>, service_account: Option<Vec<u8>>, apns: Option<ApnsSetup>) -> anyhow::Result<Option<Push>> {
+    let Some(key) = key else { return Ok(None) };
     let key: [u8; 32] = BASE64
         .decode(key.trim_ascii())
         .ok()
         .and_then(|bytes| bytes.try_into().ok())
         .ok_or_else(|| anyhow::anyhow!("the push key must be 32 bytes in base64"))?;
-    let account: ServiceAccount = serde_json::from_slice(&account)?;
-    Ok(Some(Push { vault: PushVault::new(&key), waker: Arc::new(Fcm::new(account)?), limiter: WakeLimiter::new(WAKE_EVERY) }))
+    let mut wakers: std::collections::HashMap<String, Arc<dyn Waker>> = Default::default();
+    if let Some(account) = service_account {
+        let account: ServiceAccount = serde_json::from_slice(&account)?;
+        wakers.insert(FCM.to_owned(), Arc::new(Fcm::new(account)?));
+    }
+    if let Some(apns) = apns {
+        let topics: Vec<&str> = apns.topics.iter().map(String::as_str).collect();
+        wakers.insert(APNS.to_owned(), Arc::new(Apns::new(&apns.team, &apns.key_id, &apns.key, &topics)?));
+    }
+    if wakers.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Push { vault: PushVault::new(&key), wakers, limiter: WakeLimiter::new(WAKE_EVERY) }))
 }
 
 /// Expired mail is deleted every hour (§19).
@@ -81,7 +108,13 @@ async fn main() -> anyhow::Result<()> {
     config.poc_relay = variable("FT_POC_RELAY").as_deref() == Some("1");
     let push_key = variable("FT_PUSH_KEY_FILE").map(std::fs::read).transpose()?;
     let service_account = variable("FT_FCM_SERVICE_ACCOUNT_FILE").map(std::fs::read).transpose()?;
-    config.push = push_from(push_key, service_account)?.map(Arc::new);
+    let apns = match (variable("FT_APNS_KEY_FILE"), variable("FT_APNS_KEY_ID"), variable("FT_APNS_TEAM_ID")) {
+        (Some(file), Some(key_id), Some(team)) => {
+            Some(ApnsSetup { key: std::fs::read(file)?, key_id, team, topics: topics_from(variable("FT_APNS_TOPICS")) })
+        }
+        _ => None,
+    };
+    config.push = push_from(push_key, service_account, apns)?.map(Arc::new);
 
     let listener = TcpListener::bind(listen_address(variable("FT_ROUTER_ADDR"))).await?;
     axum::serve(listener, ft_router::app(config)).await?;
@@ -113,10 +146,36 @@ mod tests {
     #[test]
     fn push_is_on_only_with_its_key_and_service_account() {
         let key = b"CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk=\n".to_vec();
-        assert!(push_from(Some(key.clone()), Some(service_account())).unwrap().is_some());
-        assert!(push_from(None, Some(service_account())).unwrap().is_none());
-        assert!(push_from(Some(key), None).unwrap().is_none());
-        assert!(push_from(Some(b"short".to_vec()), Some(service_account())).is_err(), "a wrong key is an error, not silence");
+        assert!(push_from(Some(key.clone()), Some(service_account()), None).unwrap().is_some());
+        assert!(push_from(None, Some(service_account()), None).unwrap().is_none());
+        assert!(push_from(Some(key), None, None).unwrap().is_none());
+        assert!(push_from(Some(b"short".to_vec()), Some(service_account()), None).is_err(), "a wrong key is an error, not silence");
+    }
+
+    fn apns_setup() -> ApnsSetup {
+        use p256::pkcs8::{EncodePrivateKey, LineEnding};
+        let key = p256::SecretKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        ApnsSetup {
+            key: key.to_pkcs8_pem(LineEnding::LF).unwrap().as_bytes().to_vec(),
+            key_id: "KEYID56789".to_owned(),
+            team: "TEAMID1234".to_owned(),
+            topics: topics_from(None),
+        }
+    }
+
+    // iPhones (2026-09-28): with the .p8 key, its id and the team, APNs wakes them; Android and
+    // iPhones each only with their own provider's secret.
+    #[test]
+    fn push_wakes_iphones_with_the_apns_key_and_android_with_fcm() {
+        let key = b"CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk=\n".to_vec();
+        let both = push_from(Some(key.clone()), Some(service_account()), Some(apns_setup())).unwrap().expect("on");
+        assert!(both.waker(FCM).is_some() && both.waker(APNS).is_some());
+        let iphones = push_from(Some(key.clone()), None, Some(apns_setup())).unwrap().expect("on with APNs alone");
+        assert!(iphones.waker(FCM).is_none() && iphones.waker(APNS).is_some());
+        let broken = ApnsSetup { key: b"not a key".to_vec(), ..apns_setup() };
+        assert!(push_from(Some(key), None, Some(broken)).is_err(), "a wrong .p8 is an error, not silence");
+        assert_eq!(topics_from(None), ["com.flickertalk.app", "com.flickertalk.app.dev"]);
+        assert_eq!(topics_from(Some("com.flickertalk.app".to_owned())), ["com.flickertalk.app"]);
     }
 
     #[test]
