@@ -71,6 +71,12 @@ pub trait Waker: Send + Sync {
     /// Wakes the device, saying which of its capabilities was used (0–7, app#9) and nothing else.
     async fn wake(&self, token: &str, slot: u8) -> Wake;
 
+    /// Rings the device for a call (2026-09-28): the caller said the signal is one. Where a
+    /// provider has nothing better, it is a wake-up like any other.
+    async fn ring(&self, token: &str, slot: u8) -> Wake {
+        self.wake(token, slot).await
+    }
+
     /// Whether a device may register this token: nothing this waker could not use is kept.
     fn accepts(&self, token: &str) -> bool {
         !token.is_empty()
@@ -231,10 +237,24 @@ pub enum ApnsGateway {
     Sandbox,
 }
 
-/// An iPhone's push target, as it registers it: `gateway:topic:token`, the topic being the app's
-/// bundle id (one of ours) and the token Apple's, in hex. None if it is anything else.
-pub fn apns_target<'a, S: AsRef<str>>(target: &'a str, topics: &[S]) -> Option<(ApnsGateway, &'a str, &'a str)> {
-    let mut parts = target.splitn(3, ':');
+/// An iPhone's push target, as it registers it: `gateway:topic:token[:voip]`, the topic being the
+/// app's bundle id (one of ours), the token Apple's and, if the phone gave it, PushKit's (calls,
+/// 2026-09-28), both in hex.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApnsTarget<'a> {
+    pub gateway: ApnsGateway,
+    pub topic: &'a str,
+    pub token: &'a str,
+    pub voip: Option<&'a str>,
+}
+
+fn apns_hex(token: &str) -> bool {
+    token.len().is_multiple_of(2) && (64..=200).contains(&token.len()) && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// The target, if it is one: a gateway, one of our apps and tokens in hex. None otherwise.
+pub fn apns_target<'a, S: AsRef<str>>(target: &'a str, topics: &[S]) -> Option<ApnsTarget<'a>> {
+    let mut parts = target.split(':');
     let gateway = match parts.next()? {
         "production" => ApnsGateway::Production,
         "sandbox" => ApnsGateway::Sandbox,
@@ -242,8 +262,11 @@ pub fn apns_target<'a, S: AsRef<str>>(target: &'a str, topics: &[S]) -> Option<(
     };
     let topic = parts.next()?;
     let token = parts.next()?;
-    let hex = token.len() % 2 == 0 && (64..=200).contains(&token.len()) && token.bytes().all(|byte| byte.is_ascii_hexdigit());
-    (hex && topics.iter().any(|allowed| allowed.as_ref() == topic)).then_some((gateway, topic, token))
+    let voip = parts.next();
+    if parts.next().is_some() || !apns_hex(token) || voip.is_some_and(|voip| !apns_hex(voip)) {
+        return None;
+    }
+    topics.iter().any(|allowed| allowed.as_ref() == topic).then_some(ApnsTarget { gateway, topic, token, voip })
 }
 
 #[derive(Serialize)]
@@ -314,35 +337,36 @@ impl Apns {
     }
 }
 
-#[async_trait]
-impl Waker for Apns {
-    async fn wake(&self, target: &str, slot: u8) -> Wake {
-        let Some((gateway, topic, token)) = apns_target(target, &self.topics) else { return Wake::Unregistered };
+/// One push to Apple: where, for which app, of which kind, until when, and what it says.
+struct ApnsPush<'a> {
+    gateway: ApnsGateway,
+    token: &'a str,
+    topic: String,
+    kind: &'static str,
+    expiration: u64,
+    collapse: Option<&'static str>,
+    body: serde_json::Value,
+}
+
+impl Apns {
+    async fn send(&self, push: ApnsPush<'_>) -> Wake {
         let Ok(bearer) = self.bearer().await else { return Wake::Failed };
-        let base = match gateway {
+        let base = match push.gateway {
             ApnsGateway::Production => &self.production,
             ApnsGateway::Sandbox => &self.sandbox,
         };
-        // A key the phone translates, not a text: no sender, no content, no language here.
-        // mutable-content lets the phone's own extension fetch what waits, when it has one.
-        let body = serde_json::json!({
-            "aps": { "alert": { "loc-key": "FT_PUSH_WAKE" }, "sound": "default", "mutable-content": 1 },
-            "t": "wake",
-            "s": slot,
-        });
-        let expiration = SystemTime::now().duration_since(UNIX_EPOCH).map(|now| now.as_secs() + APNS_KEEP_FOR).unwrap_or(0);
-        let sent = self
+        let mut request = self
             .http
-            .post(format!("{base}/3/device/{token}"))
+            .post(format!("{base}/3/device/{}", push.token))
             .header("authorization", format!("bearer {bearer}"))
-            .header("apns-topic", topic)
-            .header("apns-push-type", "alert")
+            .header("apns-topic", push.topic)
+            .header("apns-push-type", push.kind)
             .header("apns-priority", "10")
-            .header("apns-expiration", expiration.to_string())
-            .header("apns-collapse-id", "ft-wake")
-            .json(&body)
-            .send()
-            .await;
+            .header("apns-expiration", push.expiration.to_string());
+        if let Some(collapse) = push.collapse {
+            request = request.header("apns-collapse-id", collapse);
+        }
+        let sent = request.json(&push.body).send().await;
         match sent {
             Ok(response) if response.status().is_success() => Wake::Sent,
             Ok(response) => {
@@ -359,6 +383,54 @@ impl Waker for Apns {
             }
             Err(_) => Wake::Failed,
         }
+    }
+}
+
+#[async_trait]
+impl Waker for Apns {
+    async fn wake(&self, target: &str, slot: u8) -> Wake {
+        let Some(target) = apns_target(target, &self.topics) else { return Wake::Unregistered };
+        let expiration = SystemTime::now().duration_since(UNIX_EPOCH).map(|now| now.as_secs() + APNS_KEEP_FOR).unwrap_or(0);
+        // A key the phone translates, not a text: no sender, no content, no language here.
+        // mutable-content lets the phone's own extension fetch what waits, when it has one.
+        let body = serde_json::json!({
+            "aps": { "alert": { "loc-key": "FT_PUSH_WAKE" }, "sound": "default", "mutable-content": 1 },
+            "t": "wake",
+            "s": slot,
+        });
+        let push = ApnsPush { gateway: target.gateway, token: target.token, topic: target.topic.to_owned(), kind: "alert", expiration, collapse: Some("ft-wake"), body };
+        self.send(push).await
+    }
+
+    /// PushKit when the phone gave its token: CallKit rings, and the app, woken, reads who calls.
+    /// Otherwise a notification that a call is coming. Either way now or never.
+    async fn ring(&self, target: &str, slot: u8) -> Wake {
+        let Some(target) = apns_target(target, &self.topics) else { return Wake::Unregistered };
+        let push = match target.voip {
+            Some(voip) => ApnsPush {
+                gateway: target.gateway,
+                token: voip,
+                topic: format!("{}.voip", target.topic),
+                kind: "voip",
+                expiration: 0,
+                collapse: None,
+                body: serde_json::json!({ "t": "call", "s": slot }),
+            },
+            None => ApnsPush {
+                gateway: target.gateway,
+                token: target.token,
+                topic: target.topic.to_owned(),
+                kind: "alert",
+                expiration: 0,
+                collapse: None,
+                body: serde_json::json!({
+                    "aps": { "alert": { "loc-key": "FT_INCOMING_CALL" }, "sound": "default" },
+                    "t": "call",
+                    "s": slot,
+                }),
+            },
+        };
+        self.send(push).await
     }
 
     fn accepts(&self, target: &str) -> bool {
@@ -604,9 +676,13 @@ mod tests {
     fn an_apns_target_names_the_gateway_one_of_our_apps_and_a_token() {
         assert_eq!(
             apns_target(&format!("production:com.flickertalk.app:{DEVICE}"), TOPICS),
-            Some((ApnsGateway::Production, "com.flickertalk.app", DEVICE))
+            Some(ApnsTarget { gateway: ApnsGateway::Production, topic: "com.flickertalk.app", token: DEVICE, voip: None })
         );
-        assert_eq!(apns_target(&format!("sandbox:com.flickertalk.app.dev:{DEVICE}"), TOPICS).map(|t| t.0), Some(ApnsGateway::Sandbox));
+        assert_eq!(apns_target(&format!("sandbox:com.flickertalk.app.dev:{DEVICE}"), TOPICS).map(|t| t.gateway), Some(ApnsGateway::Sandbox));
+        // An iPhone that also gave PushKit's token can be rung for a call (2026-09-28).
+        let voip = "cd".repeat(32);
+        assert_eq!(apns_target(&format!("production:com.flickertalk.app:{DEVICE}:{voip}"), TOPICS).and_then(|t| t.voip), Some(voip.as_str()));
+        assert!(apns_target(&format!("production:com.flickertalk.app:{DEVICE}:nothex"), TOPICS).is_none());
         for wrong in [
             format!("staging:com.flickertalk.app:{DEVICE}"),
             format!("production:com.example.other:{DEVICE}"),
@@ -617,5 +693,35 @@ mod tests {
         ] {
             assert!(apns_target(&wrong, TOPICS).is_none(), "{wrong}");
         }
+    }
+
+    // A call (2026-09-28): Apple wants every VoIP push to ring through CallKit, so the router
+    // uses one only when the caller said it is a call; it carries "call" and the slot, no caller
+    // and no kind of call, and is never kept for a phone that is off. Without PushKit's token,
+    // a visible notification says a call is coming, in the phone's language.
+    #[tokio::test]
+    async fn apns_rings_a_call_through_pushkit_or_else_says_it() {
+        let (production, sandbox, at_production, _, private_pem, _) = fake_apple().await;
+        let apns = Apns::with_endpoints("TEAMID1234", "KEYID56789", private_pem.as_bytes(), TOPICS, &production, &sandbox).unwrap();
+        let voip = "cd".repeat(32);
+
+        assert_eq!(apns.ring(&format!("production:com.flickertalk.app:{DEVICE}:{voip}"), 2).await, Wake::Sent);
+        assert_eq!(apns.ring(&format!("production:com.flickertalk.app:{DEVICE}"), 0).await, Wake::Sent);
+
+        let sent = at_production.requests.lock().unwrap().clone();
+        let (path, headers, body) = &sent[0];
+        assert_eq!(path, &format!("/3/device/{voip}"), "to PushKit's token");
+        assert_eq!(headers["apns-topic"], "com.flickertalk.app.voip");
+        assert_eq!(headers["apns-push-type"], "voip");
+        assert_eq!(headers["apns-priority"], "10");
+        assert_eq!(headers["apns-expiration"], "0", "a call is now or never");
+        assert_eq!(body, &serde_json::json!({ "t": "call", "s": 2 }));
+
+        let (path, headers, body) = &sent[1];
+        assert_eq!(path, &format!("/3/device/{DEVICE}"));
+        assert_eq!(headers["apns-push-type"], "alert");
+        assert_eq!(body["aps"]["alert"], serde_json::json!({ "loc-key": "FT_INCOMING_CALL" }));
+        assert_eq!(headers["apns-expiration"], "0");
+        assert_eq!((body["t"].as_str(), body["s"].as_u64()), (Some("call"), Some(0)));
     }
 }
