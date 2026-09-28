@@ -143,3 +143,21 @@ docker build -t ft-router .                      # x86 en producción
 - `postgres/entrypoint.test.sh` prueba las tres decisiones del arranque con `wal-g` y `postgres`
   falseados; el CI además construye la imagen y comprueba que PostgreSQL arranca con el archivado
   activado.
+
+## Estado: APNs para iPhone (2026-09-28)
+
+- `PUT /v1/device/push` acepta `{"provider":"apns","token":"<entorno>:<bundle>:<token hex>"}`.
+  El entorno es `production` (App Store y TestFlight) o `sandbox` (builds de Xcode). El bundle
+  tiene que ser uno de los nuestros (`FT_APNS_TOPICS`, por defecto `com.flickertalk.app` y
+  `com.flickertalk.app.dev`). Lo que el proveedor no podría usar se rechaza con 400, igual que un
+  proveedor que no está configurado. `Push.wakers` reparte por proveedor.
+- `Apns` (`push.rs`) usa HTTP/2 y un token ES256 firmado con la clave `.p8` del equipo, que se
+  renueva cada 50 minutos. Manda una notificación **visible sin texto**: `loc-key`
+  `FT_PUSH_WAKE`, que el iPhone traduce con su propio catálogo, `mutable-content` para la futura
+  extensión de notificaciones, `t: wake` y el hueco `s`. Lleva `apns-collapse-id` `ft-wake`, así
+  que solo espera una, y la guarda un día si el teléfono está apagado. Con 410, `BadDeviceToken` o
+  `DeviceTokenNotForTopic`, el token se olvida.
+- Configuración: `FT_APNS_KEY_FILE` (secreto de Swarm, la `.p8`), `FT_APNS_KEY_ID` y
+  `FT_APNS_TEAM_ID`. El push funciona con la clave maestra y al menos un proveedor.
+- Tests: APNs contra un Apple falso por HTTP/2 que comprueba la firma ES256, las cabeceras y que el
+  cuerpo no lleva nada más; en la API, un iPhone y un Android despertados cada uno por lo suyo.

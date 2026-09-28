@@ -37,7 +37,7 @@ use tokio::sync::{mpsc, Mutex};
 use crate::auth::{self, decode_base64, ReplayGuard, SignedRequest, STANDARD_NO_PAD};
 use crate::db::{Db, MAX_BLOB};
 use crate::limits::{Limiters, Limits};
-use crate::push::{Push, Wake, FCM, MAX_TOKEN};
+use crate::push::{Push, Wake, MAX_TOKEN};
 use crate::turn::TurnIssuer;
 
 /// How long a blob waits in a mailbox (§19, provisional).
@@ -217,13 +217,15 @@ struct PushTarget {
 async fn set_push(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: Bytes) -> Result<StatusCode, StatusCode> {
     let device = authenticate(&hub, "PUT", "/v1/device/push", Signature::from_headers(&headers), &body, None).await?;
     let target: PushTarget = serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
-    if target.provider != FCM || target.token.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
     if target.token.len() > MAX_TOKEN {
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
     let push = hub.push.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    // FCM for Android, APNs for iPhones (2026-09-28); only a token its provider could use is kept.
+    let waker = push.waker(&target.provider).ok_or(StatusCode::BAD_REQUEST)?;
+    if !waker.accepts(&target.token) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let sealed = push.vault.seal(&target.token);
     match hub.db.set_push(&device, &target.provider, &sealed).await {
         Ok(true) => Ok(StatusCode::NO_CONTENT),
@@ -248,9 +250,10 @@ fn wake(hub: &Arc<Hub>, device: &str, slot: u8) {
     }
     let (hub, device) = (hub.clone(), device.to_owned());
     tokio::spawn(async move {
-        let Ok(Some((_, sealed))) = hub.db.push_of(&device).await else { return };
+        let Ok(Some((provider, sealed))) = hub.db.push_of(&device).await else { return };
+        let Some(waker) = push.waker(&provider) else { return };
         let Ok(token) = push.vault.open(&sealed) else { return };
-        if push.waker.wake(&token, slot).await == Wake::Unregistered {
+        if waker.wake(&token, slot).await == Wake::Unregistered {
             let _ = hub.db.clear_push(&device).await;
         }
     });
