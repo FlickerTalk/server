@@ -161,3 +161,10 @@ docker build -t ft-router .                      # x86 en producción
   `FT_APNS_TEAM_ID`. El push funciona con la clave maestra y al menos un proveedor.
 - Tests: APNs contra un Apple falso por HTTP/2 que comprueba la firma ES256, las cabeceras y que el
   cuerpo no lleva nada más; en la API, un iPhone y un Android despertados cada uno por lo suyo.
+- **Llamadas (2026-09-28, decisión de Ioan, `§66`/`§100`)**: `POST /v1/signal` puede llevar
+  `ft-call: 1`. Si el destinatario no está conectado, se le hace **sonar** (`Waker::ring`) en vez
+  de despertarlo. Es lo único que el router aprende: que es una llamada, no quién llama ni si es
+  de voz o de vídeo. En APNs, si el iPhone dio su token de PushKit (`…:<token>:<voip>`), se
+  manda un push VoIP (tema `bundle.voip`, `apns-expiration: 0`, cuerpo `{t: call, s}`) para que
+  suene CallKit; si no, una notificación visible `FT_INCOMING_CALL`. En FCM, `ring` es un
+  `wake`: Android ya suena solo al despertar.

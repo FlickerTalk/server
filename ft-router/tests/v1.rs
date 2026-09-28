@@ -65,6 +65,8 @@ async fn router_configured(push: Option<Arc<Push>>, limits: Limits) -> Router {
 struct FakeWaker {
     woken: std::sync::Mutex<Vec<String>>,
     slots: std::sync::Mutex<Vec<u8>>,
+    /// Rung for a call rather than woken (2026-09-28).
+    rung: std::sync::Mutex<Vec<String>>,
 }
 
 #[async_trait::async_trait]
@@ -78,9 +80,17 @@ impl Waker for FakeWaker {
             Wake::Sent
         }
     }
+    async fn ring(&self, token: &str, _slot: u8) -> Wake {
+        self.rung.lock().unwrap().push(token.to_owned());
+        Wake::Sent
+    }
 }
 
 impl FakeWaker {
+    fn rung(&self) -> Vec<String> {
+        self.rung.lock().unwrap().clone()
+    }
+
     fn woken(&self) -> Vec<String> {
         self.woken.lock().unwrap().clone()
     }
@@ -452,6 +462,31 @@ async fn an_offline_device_is_woken_when_signalled_or_written_to() {
     deposit(&router, &bob, bob.capability(), b"sealed".to_vec()).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(waker.woken().len(), 1);
+}
+
+// A call (2026-09-28): the caller says so, and an offline device is rung rather than woken, so
+// an iPhone rings through CallKit. The router learns that it is a call, and nothing else.
+#[tokio::test]
+async fn an_offline_device_is_rung_when_the_signal_is_a_call() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_with(waker.clone())).await;
+    let (alice, bob) = (Device::new(1), Device::new(2));
+    alice.register(&router).await;
+    bob.register(&router).await;
+    bob.set_push(&router, "bob-token").await;
+
+    let answer = router
+        .http
+        .post(format!("{}/v1/signal/{}", router.base, bob.id()))
+        .header("ft-capability", bob.capability())
+        .header("ft-call", "1")
+        .body(b"offer".to_vec())
+        .send()
+        .await
+        .expect("answers");
+    assert_eq!(answer.status(), 404, "still not delivered");
+    assert!(soon(|| waker.rung() == ["bob-token"]).await);
+    assert!(waker.woken().is_empty(), "rung, not woken");
 }
 
 #[tokio::test]

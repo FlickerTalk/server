@@ -243,6 +243,11 @@ async fn clear_push(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Result<S
 /// Wakes a device that is not connected, in the background and at most once in a while. A token
 /// the provider no longer knows is forgotten.
 fn wake(hub: &Arc<Hub>, device: &str, slot: u8) {
+    wake_as(hub, device, slot, false);
+}
+
+/// Wakes the device, or rings it when the signal is a call.
+fn wake_as(hub: &Arc<Hub>, device: &str, slot: u8, call: bool) {
     let Some(push) = hub.push.clone() else { return };
     // Each capability has its own pace: a quiet one never holds back the device's own (app#9).
     if !push.limiter.allow(&format!("{device}/{slot}")) {
@@ -253,7 +258,8 @@ fn wake(hub: &Arc<Hub>, device: &str, slot: u8) {
         let Ok(Some((provider, sealed))) = hub.db.push_of(&device).await else { return };
         let Some(waker) = push.waker(&provider) else { return };
         let Ok(token) = push.vault.open(&sealed) else { return };
-        if waker.wake(&token, slot).await == Wake::Unregistered {
+        let woke = if call { waker.ring(&token, slot).await } else { waker.wake(&token, slot).await };
+        if woke == Wake::Unregistered {
             let _ = hub.db.clear_push(&device).await;
         }
     });
@@ -318,7 +324,10 @@ async fn signal(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: He
     if notify(&hub, &to, message).await {
         StatusCode::ACCEPTED
     } else {
-        wake(&hub, &to, slot);
+        // The caller says a signal is a call (2026-09-28): an iPhone rings through CallKit. That
+        // it is a call is all the router learns; not who, nor voice or video.
+        let call = headers.get("ft-call").is_some_and(|value| value == "1");
+        wake_as(&hub, &to, slot, call);
         StatusCode::NOT_FOUND
     }
 }
