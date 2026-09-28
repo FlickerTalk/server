@@ -10,7 +10,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use ft_router::auth::{device_id, SignedRequest};
 use ft_router::db::Db;
 use ft_router::turn::TurnIssuer;
-use ft_router::push::{PushVault, Wake, WakeLimiter, Waker};
+use ft_router::push::{apns_target, PushVault, Wake, WakeLimiter, Waker, APNS, FCM};
 use ft_router::limits::Limits;
 use ft_router::{app, Config, Push};
 use futures_util::StreamExt;
@@ -65,6 +65,8 @@ async fn router_configured(push: Option<Arc<Push>>, limits: Limits) -> Router {
 struct FakeWaker {
     woken: std::sync::Mutex<Vec<String>>,
     slots: std::sync::Mutex<Vec<u8>>,
+    /// Rung for a call rather than woken (2026-09-28).
+    rung: std::sync::Mutex<Vec<String>>,
 }
 
 #[async_trait::async_trait]
@@ -78,9 +80,17 @@ impl Waker for FakeWaker {
             Wake::Sent
         }
     }
+    async fn ring(&self, token: &str, _slot: u8) -> Wake {
+        self.rung.lock().unwrap().push(token.to_owned());
+        Wake::Sent
+    }
 }
 
 impl FakeWaker {
+    fn rung(&self) -> Vec<String> {
+        self.rung.lock().unwrap().clone()
+    }
+
     fn woken(&self) -> Vec<String> {
         self.woken.lock().unwrap().clone()
     }
@@ -91,7 +101,28 @@ impl FakeWaker {
 }
 
 fn push_with(waker: Arc<FakeWaker>) -> Option<Arc<Push>> {
-    Some(Arc::new(Push { vault: PushVault::new(&[9; 32]), waker, limiter: WakeLimiter::new(Duration::from_secs(10)) }))
+    let wakers = [(FCM.to_owned(), waker as Arc<dyn Waker>)].into_iter().collect();
+    Some(Arc::new(Push { vault: PushVault::new(&[9; 32]), wakers, limiter: WakeLimiter::new(Duration::from_secs(10)) }))
+}
+
+/// Records what it was asked to wake, and only takes what an APNs target looks like.
+#[derive(Default)]
+struct FakeApns(FakeWaker);
+
+#[async_trait::async_trait]
+impl Waker for FakeApns {
+    async fn wake(&self, token: &str, slot: u8) -> Wake {
+        self.0.wake(token, slot).await
+    }
+
+    fn accepts(&self, token: &str) -> bool {
+        apns_target(token, &["com.flickertalk.app"]).is_some()
+    }
+}
+
+fn push_for_both(android: Arc<FakeWaker>, iphones: Arc<FakeApns>) -> Option<Arc<Push>> {
+    let wakers = [(FCM.to_owned(), android as Arc<dyn Waker>), (APNS.to_owned(), iphones as Arc<dyn Waker>)].into_iter().collect();
+    Some(Arc::new(Push { vault: PushVault::new(&[9; 32]), wakers, limiter: WakeLimiter::new(Duration::from_secs(10)) }))
 }
 
 /// Waits a little for work the router does in the background.
@@ -346,9 +377,41 @@ async fn a_device_can_forget_itself() {
 
 impl Device {
     async fn set_push(&self, router: &Router, token: &str) -> reqwest::Response {
-        let body = serde_json::to_vec(&json!({ "provider": "fcm", "token": token })).unwrap();
+        self.set_push_with(router, "fcm", token).await
+    }
+
+    async fn set_push_with(&self, router: &Router, provider: &str, token: &str) -> reqwest::Response {
+        let body = serde_json::to_vec(&json!({ "provider": provider, "token": token })).unwrap();
         self.request(router, "PUT", "/v1/device/push", body).await
     }
+}
+
+// iPhones (2026-09-28): an iPhone leaves an APNs target and is woken through APNs, an Android
+// phone through FCM; a target APNs could not use is refused, and so is a provider not set up.
+#[tokio::test]
+async fn an_iphone_is_woken_through_apns_and_an_android_phone_through_fcm() {
+    let (android, iphones) = (Arc::new(FakeWaker::default()), Arc::new(FakeApns::default()));
+    let router = router_with(push_for_both(android.clone(), iphones.clone())).await;
+    let (alice, bob, carol) = (Device::new(1), Device::new(2), Device::new(3));
+    for device in [&alice, &bob, &carol] {
+        device.register(&router).await;
+    }
+    let target = format!("production:com.flickertalk.app:{}", "ab".repeat(32));
+    assert_eq!(bob.set_push_with(&router, "apns", "production:com.example.other:abab").await.status(), 400);
+    assert_eq!(bob.set_push_with(&router, "apns", &target).await.status(), 204);
+    assert_eq!(carol.set_push(&router, "carol-fcm-token").await.status(), 204);
+    assert_eq!(router.db.push_of(&bob.id()).await.unwrap().expect("stored").0, "apns");
+
+    deposit(&router, &bob, bob.capability(), b"sealed for bob".to_vec()).await;
+    deposit(&router, &carol, carol.capability(), b"sealed for carol".to_vec()).await;
+    assert!(soon(|| iphones.0.woken() == [target.clone()]).await, "bob's iPhone through APNs");
+    assert!(soon(|| android.woken() == ["carol-fcm-token"]).await, "carol's Android through FCM");
+
+    // Without APNs set up, an iPhone's target is refused rather than kept for nothing.
+    let router = router_with(push_with(Arc::default())).await;
+    let dave = Device::new(4);
+    dave.register(&router).await;
+    assert_eq!(dave.set_push_with(&router, "apns", &target).await.status(), 400);
 }
 
 // §8–12: a device leaves where it can be woken, encrypted with a key that is not in the database.
@@ -399,6 +462,31 @@ async fn an_offline_device_is_woken_when_signalled_or_written_to() {
     deposit(&router, &bob, bob.capability(), b"sealed".to_vec()).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(waker.woken().len(), 1);
+}
+
+// A call (2026-09-28): the caller says so, and an offline device is rung rather than woken, so
+// an iPhone rings through CallKit. The router learns that it is a call, and nothing else.
+#[tokio::test]
+async fn an_offline_device_is_rung_when_the_signal_is_a_call() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_with(waker.clone())).await;
+    let (alice, bob) = (Device::new(1), Device::new(2));
+    alice.register(&router).await;
+    bob.register(&router).await;
+    bob.set_push(&router, "bob-token").await;
+
+    let answer = router
+        .http
+        .post(format!("{}/v1/signal/{}", router.base, bob.id()))
+        .header("ft-capability", bob.capability())
+        .header("ft-call", "1")
+        .body(b"offer".to_vec())
+        .send()
+        .await
+        .expect("answers");
+    assert_eq!(answer.status(), 404, "still not delivered");
+    assert!(soon(|| waker.rung() == ["bob-token"]).await);
+    assert!(waker.woken().is_empty(), "rung, not woken");
 }
 
 #[tokio::test]
