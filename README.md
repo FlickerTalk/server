@@ -31,3 +31,7 @@ to `main`, and the version plus `latest` on every `vX.Y.Z` tag.
 
 [AGPL-3.0](LICENSE). The client is in [FlickerTalk/app](https://github.com/FlickerTalk/app).
 Security issues: see [SECURITY.md](SECURITY.md).
+
+The FlickerTalk name and logo are not licensed under the AGPL (section 7(e)): forks are welcome,
+but must use their own name and icon. The public router at `api.flickertalk.com` serves the
+official FlickerTalk apps only; a fork should run its own router from this repository.
