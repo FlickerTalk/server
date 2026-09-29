@@ -182,7 +182,8 @@ impl Device {
 
     async fn connect(&self, router: &Router) -> Socket {
         let path = "/v1/connect";
-        let headers = self.sign("GET", path, b"", "connect-nonce");
+        // A fresh nonce each time, as the app does: a device reconnects.
+        let headers = self.sign("GET", path, b"", &uuid::Uuid::now_v7().to_string());
         let query: Vec<String> = headers.iter().map(|(name, value)| format!("{name}={}", urlencode(value))).collect();
         let url = format!("{}{path}?{}", router.base.replace("http", "ws"), query.join("&"));
         let (socket, _) = connect_async(url).await.expect("connects");
@@ -656,3 +657,122 @@ async fn a_single_capability_is_still_the_first() {
     assert!(soon(|| waker.slots() == [0]).await);
 }
 
+
+/// Nothing more arrives on the socket for a while (pings aside).
+async fn nothing_more(socket: &mut Socket) -> bool {
+    loop {
+        match timeout(Duration::from_millis(300), socket.next()).await {
+            Err(_) => return true,
+            Ok(Some(Ok(Message::Text(_)))) => return false,
+            Ok(Some(Ok(_))) => continue,
+            Ok(_) => return true,
+        }
+    }
+}
+
+async fn next_signal(socket: &mut Socket) -> Vec<u8> {
+    let frame = next_json(socket).await;
+    assert_eq!(frame["kind"], "signal");
+    STANDARD_NO_PAD.decode(frame["signal"].as_str().unwrap()).unwrap()
+}
+
+// §15: a signal for a device that is not connected waits for it in memory, and is handed over,
+// in order and once, as soon as it connects. The sender learns it waits, still with a 404: the
+// apps from before 0.4 read a 404 as "not connected" and go on as they did.
+#[tokio::test]
+async fn a_signal_for_an_offline_device_waits_for_it_to_connect() {
+    let router = router().await;
+    let bob = Device::new(2);
+    bob.register(&router).await;
+
+    for offer in [b"first".to_vec(), b"second".to_vec()] {
+        let answer = signal(&router, &bob, bob.capability(), offer).await;
+        assert_eq!(answer.status(), 404, "bob is not connected");
+        assert_eq!(answer.headers().get("ft-retained").map(|value| value.to_str().unwrap()), Some("1"), "but it waits for him");
+    }
+
+    let mut socket = bob.connect(&router).await;
+    assert_eq!(next_json(&mut socket).await["kind"], "welcome", "the welcome comes first");
+    assert_eq!(next_signal(&mut socket).await, b"first");
+    assert_eq!(next_signal(&mut socket).await, b"second");
+    assert!(nothing_more(&mut socket).await);
+    drop(socket);
+
+    let mut again = bob.connect(&router).await;
+    assert_eq!(next_json(&mut again).await["kind"], "welcome");
+    assert!(nothing_more(&mut again).await, "never handed over twice");
+
+    let live = signal(&router, &bob, bob.capability(), b"third".to_vec()).await;
+    assert_eq!(live.status(), 202);
+    assert!(live.headers().get("ft-retained").is_none(), "handed over at once, not held");
+    assert_eq!(next_signal(&mut again).await, b"third");
+}
+
+// A call to a phone that is not connected still rings it, and the offer is there when it
+// connects: the caller no longer has to send it again and again.
+#[tokio::test]
+async fn a_call_waits_for_the_phone_it_rings() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_with(waker.clone())).await;
+    let bob = Device::new(2);
+    bob.register(&router).await;
+    bob.set_push(&router, "bob-token").await;
+
+    let answer = router
+        .http
+        .post(format!("{}/v1/signal/{}", router.base, bob.id()))
+        .header("ft-capability", bob.capability())
+        .header("ft-call", "1")
+        .body(b"call offer".to_vec())
+        .send()
+        .await
+        .expect("answers");
+    assert_eq!(answer.status(), 404);
+    assert!(answer.headers().contains_key("ft-retained"));
+    assert!(soon(|| waker.rung() == ["bob-token"]).await);
+
+    let mut socket = bob.connect(&router).await;
+    next_json(&mut socket).await;
+    assert_eq!(next_signal(&mut socket).await, b"call offer");
+}
+
+// What the router refuses is never held: a stranger's signal, one too big, one over the limit.
+#[tokio::test]
+async fn a_refused_signal_is_not_held() {
+    let router = router_limited(limits(1000, 3, 1000)).await;
+    let bob = Device::new(2);
+    bob.register(&router).await;
+
+    let stranger = signal(&router, &bob, STANDARD_NO_PAD.encode([0u8; 32]), b"spam".to_vec()).await;
+    assert_eq!(stranger.status(), 403);
+    assert!(!stranger.headers().contains_key("ft-retained"));
+    assert_eq!(signal(&router, &bob, bob.capability(), b"kept".to_vec()).await.status(), 404);
+    let big = signal(&router, &bob, bob.capability(), vec![0; 17 * 1024]).await;
+    assert_eq!(big.status(), 413);
+    assert!(!big.headers().contains_key("ft-retained"));
+    assert_eq!(signal(&router, &bob, bob.capability(), b"one more".to_vec()).await.status(), 404);
+    let flood = signal(&router, &bob, bob.capability(), b"flood".to_vec()).await;
+    assert_eq!(flood.status(), 429);
+    assert!(!flood.headers().contains_key("ft-retained"));
+
+    let mut socket = bob.connect(&router).await;
+    next_json(&mut socket).await;
+    assert_eq!(next_signal(&mut socket).await, b"kept");
+    assert_eq!(next_signal(&mut socket).await, b"one more");
+    assert!(nothing_more(&mut socket).await);
+}
+
+// A device that forgets itself leaves nothing waiting for it.
+#[tokio::test]
+async fn forgetting_a_device_drops_what_waits_for_it() {
+    let router = router().await;
+    let bob = Device::new(2);
+    bob.register(&router).await;
+    signal(&router, &bob, bob.capability(), b"offer".to_vec()).await;
+    assert_eq!(bob.request(&router, "DELETE", "/v1/device", vec![]).await.status(), 204);
+
+    bob.register(&router).await;
+    let mut socket = bob.connect(&router).await;
+    next_json(&mut socket).await;
+    assert!(nothing_more(&mut socket).await);
+}

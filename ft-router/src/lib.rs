@@ -13,6 +13,7 @@ pub mod auth;
 pub mod db;
 pub mod limits;
 pub mod turn;
+pub mod waiting;
 pub mod push;
 
 pub use push::Push;

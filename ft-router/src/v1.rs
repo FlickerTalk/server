@@ -4,7 +4,14 @@
 //!   hash of the route capability. The app registers on every start.
 //! - `GET /v1/connect`: signed WebSocket. The router sends a welcome (STUN and a temporary TURN
 //!   user), the signals addressed to the device and a notice when mail arrives.
-//! - `POST /v1/signal/{to}`: needs the recipient's capability; 404 when it is not connected.
+//! - `POST /v1/signal/{to}`: needs the recipient's capability. `202` when the recipient is
+//!   connected and the signal went to its socket. When it is not connected, `404` as before, now
+//!   with `ft-retained: 1` (0.4.0): the router woke it (or rang it, with `ft-call: 1`) and holds the
+//!   signal in memory for up to 55 s, to hand it over, in order and once, right after the welcome
+//!   of its next `/v1/connect` (see `waiting.rs`: eight per recipient and 32 MiB in all, the oldest
+//!   dropped first). The status stays `404` on purpose: apps before 0.4 read `202` as "connected"
+//!   and would wait for a data channel before falling back to the mailbox; with `404` they go on as
+//!   they did, and a sender that knows the header keeps its offer open and waits for the answer.
 //! - `POST /v1/mailbox/{to}`: needs the recipient's capability, not the sender's identity: the
 //!   router does not learn who writes to whom through the mailbox.
 //! - `GET /v1/mailbox`, `DELETE /v1/mailbox/{id}`: signed by the owner.
@@ -15,12 +22,14 @@
 //!
 //! Requests are limited per device, per recipient and per origin (`limits.rs`, §91): 429 beyond.
 //!
-//! Nothing is logged (§71). Connections live in memory, so signalling needs a single replica
-//! until it is shared through PostgreSQL (§106).
+//! Nothing is logged (§71). Connections and the signals waiting for a device live in memory only
+//! (never in the database, on disk or in a log), so signalling needs a single replica until it is
+//! shared between replicas (§106).
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Weak;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -39,6 +48,7 @@ use crate::db::{Db, MAX_BLOB};
 use crate::limits::{Limiters, Limits};
 use crate::push::{Push, Wake, MAX_TOKEN};
 use crate::turn::TurnIssuer;
+use crate::waiting::{Retention, Waiting, SWEEP_EVERY};
 
 /// How long a blob waits in a mailbox (§19, provisional).
 pub const MAILBOX_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -51,6 +61,9 @@ pub struct Hub {
     db: Arc<Db>,
     guard: ReplayGuard,
     online: Mutex<HashMap<String, mpsc::UnboundedSender<String>>>,
+    /// Signals for devices that are not connected (§15). Held and handed over under the lock of
+    /// `online`, so a device gets them before anything sent to it once it is connected.
+    waiting: Waiting,
     stun: Vec<String>,
     turn: Option<TurnIssuer>,
     push: Option<Arc<Push>>,
@@ -59,7 +72,16 @@ pub struct Hub {
 
 impl Hub {
     pub fn new(db: Arc<Db>, stun: Vec<String>, turn: Option<TurnIssuer>, push: Option<Arc<Push>>, limits: Limits) -> Self {
-        Self { db, guard: ReplayGuard::default(), online: Mutex::default(), stun, turn, push, limiters: Limiters::new(limits) }
+        Self {
+            db,
+            guard: ReplayGuard::default(),
+            online: Mutex::default(),
+            waiting: Waiting::new(Retention::default()),
+            stun,
+            turn,
+            push,
+            limiters: Limiters::new(limits),
+        }
     }
 
     /// One more request from this origin; 429 once it is over its share.
@@ -81,6 +103,9 @@ impl Hub {
 }
 
 pub fn routes(hub: Arc<Hub>) -> Router {
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn(sweep(Arc::downgrade(&hub)));
+    }
     Router::new()
         .route("/v1/device/register", post(register))
         .route("/v1/device", delete(forget))
@@ -91,6 +116,16 @@ pub fn routes(hub: Arc<Hub>) -> Router {
         .route("/v1/mailbox/{target}", post(deposit).delete(acknowledge))
         .route("/v1/turn-credentials", get(turn_credentials))
         .with_state(hub)
+}
+
+/// Frees the signals that waited too long, while the hub lives.
+async fn sweep(hub: Weak<Hub>) {
+    let mut every = tokio::time::interval(SWEEP_EVERY);
+    loop {
+        every.tick().await;
+        let Some(hub) = hub.upgrade() else { return };
+        hub.waiting.sweep(Instant::now());
+    }
 }
 
 fn now_ms() -> i64 {
@@ -204,7 +239,9 @@ async fn register(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: Bytes) 
 async fn forget(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Result<StatusCode, StatusCode> {
     let device = authenticate(&hub, "DELETE", "/v1/device", Signature::from_headers(&headers), b"", None).await?;
     hub.db.forget(&device).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    hub.online.lock().await.remove(&device);
+    let mut online = hub.online.lock().await;
+    online.remove(&device);
+    hub.waiting.take(&device, Instant::now());
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -279,8 +316,15 @@ async fn connect(
 
 async fn serve(hub: Arc<Hub>, device: String, mut socket: WebSocket) {
     let (outbox, mut pending) = mpsc::unbounded_channel::<String>();
-    // A newer connection of the same device replaces the older one.
-    hub.online.lock().await.insert(device.clone(), outbox.clone());
+    {
+        // A newer connection of the same device replaces the older one. What waited for the
+        // device goes first, in order: signals sent from now on queue behind it.
+        let mut online = hub.online.lock().await;
+        online.insert(device.clone(), outbox.clone());
+        for signal in hub.waiting.take(&device, Instant::now()) {
+            let _ = outbox.send(signal_frame(&signal));
+        }
+    }
 
     let turn = hub.turn.as_ref().map(|issuer| issuer.issue(SystemTime::now()));
     let welcome = json!({ "kind": "welcome", "stun": hub.stun, "turn": turn }).to_string();
@@ -295,6 +339,9 @@ async fn serve(hub: Arc<Hub>, device: String, mut socket: WebSocket) {
         }
     }
 
+    // From here a signal for this device cannot reach the socket: sending to it fails, so the
+    // signal waits for the next connection instead of vanishing in this queue.
+    pending.close();
     let mut online = hub.online.lock().await;
     if online.get(&device).is_some_and(|current| current.same_channel(&outbox)) {
         online.remove(&device);
@@ -306,30 +353,39 @@ async fn notify(hub: &Hub, device: &str, message: Value) -> bool {
     online.is_some_and(|outbox| outbox.send(message.to_string()).is_ok())
 }
 
-async fn signal(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: HeaderMap, body: Bytes) -> StatusCode {
+/// A signal as the socket carries it.
+fn signal_frame(signal: &[u8]) -> String {
+    json!({ "kind": "signal", "signal": STANDARD_NO_PAD.encode(signal) }).to_string()
+}
+
+async fn signal(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: HeaderMap, body: Bytes) -> Response {
+    // Everything that refuses a signal comes before holding it: the limits and the size bound
+    // what a sender can make the router keep.
     if let Err(status) = hub.limit_origin(&headers) {
-        return status;
+        return status.into_response();
     }
     let slot = match check_capability(&hub, &to, &headers).await {
         Ok(slot) => slot,
-        Err(status) => return status,
+        Err(status) => return status.into_response(),
     };
     if let Err(status) = hub.limit_recipient(&to) {
-        return status;
+        return status.into_response();
     }
     if body.len() > MAX_SIGNAL {
-        return StatusCode::PAYLOAD_TOO_LARGE;
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     }
-    let message = json!({ "kind": "signal", "signal": STANDARD_NO_PAD.encode(&body) });
-    if notify(&hub, &to, message).await {
-        StatusCode::ACCEPTED
-    } else {
-        // The caller says a signal is a call (2026-09-28): an iPhone rings through CallKit. That
-        // it is a call is all the router learns; not who, nor voice or video.
-        let call = headers.get("ft-call").is_some_and(|value| value == "1");
-        wake_as(&hub, &to, slot, call);
-        StatusCode::NOT_FOUND
+    {
+        let online = hub.online.lock().await;
+        if online.get(&to).is_some_and(|outbox| outbox.send(signal_frame(&body)).is_ok()) {
+            return StatusCode::ACCEPTED.into_response();
+        }
+        hub.waiting.hold(&to, body.to_vec(), Instant::now());
     }
+    // The caller says a signal is a call (2026-09-28): an iPhone rings through CallKit. That it
+    // is a call is all the router learns; not who, nor voice or video.
+    let call = headers.get("ft-call").is_some_and(|value| value == "1");
+    wake_as(&hub, &to, slot, call);
+    (StatusCode::NOT_FOUND, [("ft-retained", "1")]).into_response()
 }
 
 async fn deposit(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: HeaderMap, body: Bytes) -> StatusCode {
