@@ -202,14 +202,26 @@ impl Fcm {
 #[async_trait]
 impl Waker for Fcm {
     async fn wake(&self, token: &str, slot: u8) -> Wake {
+        self.send(token, "wake", slot, "60s").await
+    }
+
+    /// A call says so (2026-09-28): a closed app only shows "something new" for a wake-up, and a
+    /// call has to ring. It lives as long as the caller rings, 45 s.
+    async fn ring(&self, token: &str, slot: u8) -> Wake {
+        self.send(token, "call", slot, "45s").await
+    }
+}
+
+impl Fcm {
+    async fn send(&self, token: &str, kind: &str, slot: u8, ttl: &str) -> Wake {
         let Ok(access) = self.access_token().await else { return Wake::Failed };
         // Data only, high priority, short-lived: the app wakes and fetches; nothing to read here.
         let message = serde_json::json!({
             "message": {
                 "token": token,
                 // Which capability was used: the phone stays quiet for a closed hidden session.
-                "data": { "t": "wake", "s": slot.to_string() },
-                "android": { "priority": "high", "ttl": "60s" }
+                "data": { "t": kind, "s": slot.to_string() },
+                "android": { "priority": "high", "ttl": ttl }
             }
         });
         let url = format!("{}/v1/projects/{}/messages:send", self.endpoint, self.account.project_id);
@@ -554,6 +566,23 @@ mod tests {
         // Besides "wake", only which of the eight capabilities was used (app#9): no sender, no content.
         assert_eq!(messages[0].1["message"]["data"], serde_json::json!({ "t": "wake", "s": "0" }));
         assert!(messages[0].1["message"].get("notification").is_none(), "nothing to show, nothing to read");
+    }
+
+    // Found on a Samsung (2026-09-28): a call to a closed app arrived as a plain wake-up, the phone
+    // only showed "something new" and never rang. A call says so, and lives only as long as the
+    // caller keeps ringing (45 s): a late one would ring for nobody.
+    #[tokio::test]
+    async fn fcm_rings_a_call_as_a_call() {
+        let (base, google, private_pem) = fake_google().await;
+        let fcm = Fcm::with_endpoint(account(&base, private_pem), &base).unwrap();
+
+        assert_eq!(fcm.ring("device-token", 2).await, Wake::Sent);
+
+        let messages = google.seen.messages.lock().unwrap().clone();
+        let message = &messages[0].1["message"];
+        assert_eq!(message["data"], serde_json::json!({ "t": "call", "s": "2" }));
+        assert_eq!(message["android"], serde_json::json!({ "priority": "high", "ttl": "45s" }));
+        assert!(message.get("notification").is_none(), "still nothing to read: who calls comes over P2P");
     }
 
     #[tokio::test]
