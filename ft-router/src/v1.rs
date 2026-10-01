@@ -8,8 +8,8 @@
 //!   user), the signals addressed to the device and a notice when mail arrives.
 //! - `POST /v1/signal/{to}`: needs the recipient's capability. `202` when the recipient is
 //!   connected and the signal went to its socket. When it is not connected, `404` as before, now
-//!   with `ft-retained: 1` (0.4.0): the router woke it (or rang it, with `ft-call: 1`) and holds the
-//!   signal in memory for up to 55 s, to hand it over, in order and once, right after the welcome
+//!   with `ft-retained: 1` (0.4.0): the router woke it (or rang it, with `ft-call: 1`; neither for a
+//!   silent slot, with the same answer) and holds the signal in memory for up to 55 s, to hand it over, in order and once, right after the welcome
 //!   of its next `/v1/connect` (see `waiting.rs`: eight per recipient and 32 MiB in all, the oldest
 //!   dropped first). The status stays `404` on purpose: apps before 0.4 read `202` as "connected"
 //!   and would wait for a data channel before falling back to the mailbox; with `404` they go on as
