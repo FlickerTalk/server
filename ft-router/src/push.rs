@@ -83,6 +83,13 @@ pub trait Waker: Send + Sync {
     }
 }
 
+/// Whether a push for `slot` must not be sent, given the device's `silent_slots` (2026-10-01):
+/// bit i set means slot i is silent, a session the user has left. The main list (slot 0) is never
+/// silent. The mask is opaque: nothing else is read from it.
+pub fn silent(silent_slots: u8, slot: u8) -> bool {
+    slot != 0 && 1u8.checked_shl(u32::from(slot)).is_some_and(|bit| silent_slots & bit != 0)
+}
+
 /// Lets a device be woken at most once every `every`.
 pub struct WakeLimiter {
     every: Duration,
@@ -473,6 +480,20 @@ mod tests {
         let mut tampered = sealed.clone();
         *tampered.last_mut().unwrap() ^= 1;
         assert!(vault.open(&tampered).is_err());
+    }
+
+    // Silent slots (2026-10-01): bit i set means slot i is silent. The main list (slot 0) always
+    // rings, whatever its bit says, and a slot outside the eight is never silent.
+    #[test]
+    fn a_slot_is_silent_only_when_its_bit_is_set_and_it_is_not_the_main_list() {
+        assert!(silent(0b0000_1000, 3));
+        assert!(!silent(0b0000_1000, 2), "only its own bit");
+        assert!(!silent(0b1111_0111, 3));
+        assert!(!silent(0, 7), "nothing is silent by default");
+        assert!(silent(0b1000_0000, 7));
+        assert!(!silent(0b1111_1111, 0), "the main list always rings");
+        assert!(!silent(0b1111_1111, 8), "there are only eight slots");
+        assert!(!silent(0b1111_1111, 200));
     }
 
     #[test]

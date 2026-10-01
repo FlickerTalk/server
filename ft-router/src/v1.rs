@@ -1,13 +1,15 @@
 //! Router API v1 (Plan §7, §10, §13–19, §34, §106 M2).
 //!
 //! - `POST /v1/device/register`: signed with the key being registered; stores that key and the
-//!   hash of the route capability. The app registers on every start.
+//!   hash of the route capability. The app registers on every start. Since 0.5.0 it may carry
+//!   `silent_slots` (0–255, bit i = slot i): no push goes out for those slots, sessions the user
+//!   has left; slot 0, the main list, always gets them. Each registration replaces the mask.
 //! - `GET /v1/connect`: signed WebSocket. The router sends a welcome (STUN and a temporary TURN
 //!   user), the signals addressed to the device and a notice when mail arrives.
 //! - `POST /v1/signal/{to}`: needs the recipient's capability. `202` when the recipient is
 //!   connected and the signal went to its socket. When it is not connected, `404` as before, now
-//!   with `ft-retained: 1` (0.4.0): the router woke it (or rang it, with `ft-call: 1`) and holds the
-//!   signal in memory for up to 55 s, to hand it over, in order and once, right after the welcome
+//!   with `ft-retained: 1` (0.4.0): the router woke it (or rang it, with `ft-call: 1`; neither for a
+//!   silent slot, with the same answer) and holds the signal in memory for up to 55 s, to hand it over, in order and once, right after the welcome
 //!   of its next `/v1/connect` (see `waiting.rs`: eight per recipient and 32 MiB in all, the oldest
 //!   dropped first). The status stays `404` on purpose: apps before 0.4 read `202` as "connected"
 //!   and would wait for a data channel before falling back to the mailbox; with `404` they go on as
@@ -212,6 +214,10 @@ struct Registration {
     /// Eight capabilities, always eight (app#9); apps from before send only the one above.
     #[serde(default)]
     capability_hashes: Option<Vec<String>>,
+    /// Which slots are silent (2026-10-01): bit i set means slot i, a session the user has left,
+    /// gets no push. An integer 0–255, anything else is refused; absent (apps from before) is 0.
+    #[serde(default)]
+    silent_slots: u8,
 }
 
 async fn register(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: Bytes) -> Result<StatusCode, StatusCode> {
@@ -229,7 +235,9 @@ async fn register(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: Bytes) 
     };
     let device =
         authenticate(&hub, "POST", "/v1/device/register", Signature::from_headers(&headers), &body, Some(key)).await?;
-    hub.db.register(&device, &key, &hash).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // The main list always rings: its bit is never kept.
+    let silent_slots = registration.silent_slots & !1;
+    hub.db.register(&device, &key, &hash, silent_slots).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if let Some(eight) = eight {
         hub.db.set_capabilities(&device, &eight).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     }
@@ -283,7 +291,10 @@ fn wake(hub: &Arc<Hub>, device: &str, slot: u8) {
     wake_as(hub, device, slot, false);
 }
 
-/// Wakes the device, or rings it when the signal is a call.
+/// Wakes the device, or rings it when the signal is a call. Nothing goes out for a slot the device
+/// said is silent (2026-10-01), a session the user has left; that is decided in the background,
+/// after the pace is taken, so the sender's answer, its timing and the pace are the same whether
+/// the push goes out or not.
 fn wake_as(hub: &Arc<Hub>, device: &str, slot: u8, call: bool) {
     let Some(push) = hub.push.clone() else { return };
     // Each capability has its own pace: a quiet one never holds back the device's own (app#9).
@@ -292,7 +303,7 @@ fn wake_as(hub: &Arc<Hub>, device: &str, slot: u8, call: bool) {
     }
     let (hub, device) = (hub.clone(), device.to_owned());
     tokio::spawn(async move {
-        let Ok(Some((provider, sealed))) = hub.db.push_of(&device).await else { return };
+        let Ok(Some((provider, sealed))) = hub.db.push_for(&device, slot).await else { return };
         let Some(waker) = push.waker(&provider) else { return };
         let Ok(token) = push.vault.open(&sealed) else { return };
         let woke = if call { waker.ring(&token, slot).await } else { waker.wake(&token, slot).await };

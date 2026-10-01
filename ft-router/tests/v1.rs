@@ -67,6 +67,7 @@ struct FakeWaker {
     slots: std::sync::Mutex<Vec<u8>>,
     /// Rung for a call rather than woken (2026-09-28).
     rung: std::sync::Mutex<Vec<String>>,
+    rung_slots: std::sync::Mutex<Vec<u8>>,
 }
 
 #[async_trait::async_trait]
@@ -80,8 +81,9 @@ impl Waker for FakeWaker {
             Wake::Sent
         }
     }
-    async fn ring(&self, token: &str, _slot: u8) -> Wake {
+    async fn ring(&self, token: &str, slot: u8) -> Wake {
         self.rung.lock().unwrap().push(token.to_owned());
+        self.rung_slots.lock().unwrap().push(slot);
         Wake::Sent
     }
 }
@@ -97,6 +99,10 @@ impl FakeWaker {
 
     fn slots(&self) -> Vec<u8> {
         self.slots.lock().unwrap().clone()
+    }
+
+    fn rung_slots(&self) -> Vec<u8> {
+        self.rung_slots.lock().unwrap().clone()
     }
 }
 
@@ -775,4 +781,244 @@ async fn forgetting_a_device_drops_what_waits_for_it() {
     let mut socket = bob.connect(&router).await;
     next_json(&mut socket).await;
     assert!(nothing_more(&mut socket).await);
+}
+
+// ---- Silent slots (2026-10-01) ----
+//
+// A session the user has left is silent: the phone says which of its eight slots are (a bitmask,
+// bit i = slot i) and the router sends no push for them, because an iPhone shows an APNs alert
+// and rings a VoIP push whatever the app decides.
+
+impl Device {
+    /// Registers the eight capabilities with `silent_slots` as given, any JSON at all.
+    async fn register_silent(&self, router: &Router, silent_slots: Value) -> reqwest::Response {
+        let hashes: Vec<String> =
+            eight(self).iter().map(|capability| STANDARD_NO_PAD.encode(blake3::hash(capability).as_bytes())).collect();
+        let body = json!({
+            "signing_key": STANDARD_NO_PAD.encode(self.key.verifying_key().to_bytes()),
+            "capability_hash": hashes[0],
+            "capability_hashes": hashes,
+            "silent_slots": silent_slots,
+        });
+        self.request(router, "POST", "/v1/device/register", serde_json::to_vec(&body).unwrap()).await
+    }
+}
+
+/// The capability of one of the eight slots, as a sender holds it.
+fn slot_capability(device: &Device, slot: usize) -> String {
+    STANDARD_NO_PAD.encode(eight(device)[slot])
+}
+
+// An app from before sends no mask: nothing is silent, as ever.
+#[tokio::test]
+async fn a_registration_without_silent_slots_leaves_nothing_silent() {
+    let router = router().await;
+    let bob = Device::new(2);
+    assert_eq!(bob.register_eight(&router).await.status(), 204);
+    assert_eq!(router.db.silent_slots(&bob.id()).await.unwrap(), Some(0));
+    assert_eq!(bob.register(&router).await.status(), 204, "nor with a single capability");
+    assert_eq!(router.db.silent_slots(&bob.id()).await.unwrap(), Some(0));
+}
+
+// The main list (bit 0) can never be silenced: the router clears its bit.
+#[tokio::test]
+async fn a_registration_carries_the_silent_slots_but_never_the_main_list() {
+    let router = router().await;
+    let bob = Device::new(2);
+    assert_eq!(bob.register_silent(&router, json!(0b1000_0111)).await.status(), 204);
+    assert_eq!(router.db.silent_slots(&bob.id()).await.unwrap(), Some(0b1000_0110));
+    let carol = Device::new(3);
+    assert_eq!(carol.register_silent(&router, json!(255)).await.status(), 204);
+    assert_eq!(router.db.silent_slots(&carol.id()).await.unwrap(), Some(0b1111_1110));
+}
+
+// Like any other malformed registration: 400, and nothing is stored.
+#[tokio::test]
+async fn malformed_silent_slots_are_refused() {
+    let router = router().await;
+    let bob = Device::new(2);
+    for wrong in [json!(256), json!(-1), json!(1.5), json!(2.0), json!("6"), json!(null), json!(true), json!([1]), json!({})] {
+        assert_eq!(bob.register_silent(&router, wrong.clone()).await.status(), 400, "{wrong}");
+    }
+    assert!(router.db.signing_key(&bob.id()).await.unwrap().is_none(), "never registered");
+}
+
+// Leaving a session and coming back to it: each registration replaces the mask, and one without
+// the field clears it.
+#[tokio::test]
+async fn each_registration_replaces_the_silent_slots() {
+    let router = router().await;
+    let bob = Device::new(2);
+    bob.register_silent(&router, json!(0b0000_1000)).await;
+    assert_eq!(router.db.silent_slots(&bob.id()).await.unwrap(), Some(0b0000_1000));
+    bob.register_silent(&router, json!(0)).await;
+    assert_eq!(router.db.silent_slots(&bob.id()).await.unwrap(), Some(0));
+    bob.register_silent(&router, json!(0b0010_1000)).await;
+    assert_eq!(router.db.silent_slots(&bob.id()).await.unwrap(), Some(0b0010_1000));
+    bob.register_eight(&router).await;
+    assert_eq!(router.db.silent_slots(&bob.id()).await.unwrap(), Some(0), "absent is 0");
+}
+
+/// FCM and APNs, both fake, paced as given: `Duration::ZERO` lets every push through.
+fn push_paced(android: Arc<FakeWaker>, iphones: Arc<FakeApns>, every: Duration) -> Option<Arc<Push>> {
+    let wakers = [(FCM.to_owned(), android as Arc<dyn Waker>), (APNS.to_owned(), iphones as Arc<dyn Waker>)].into_iter().collect();
+    Some(Arc::new(Push { vault: PushVault::new(&[9; 32]), wakers, limiter: WakeLimiter::new(every) }))
+}
+
+fn iphone_target(seed: u8) -> String {
+    format!("production:com.flickertalk.app:{}", format!("{seed:02x}").repeat(32))
+}
+
+/// What a sender sees of an answer: the status and every header but the date.
+async fn seen(response: reqwest::Response) -> (u16, std::collections::BTreeMap<String, String>) {
+    let headers = response
+        .headers()
+        .iter()
+        .filter(|(name, _)| name.as_str() != "date")
+        .map(|(name, value)| (name.to_string(), value.to_str().unwrap().to_owned()))
+        .collect();
+    (response.status().as_u16(), headers)
+}
+
+async fn call(router: &Router, to: &Device, capability: String, bytes: Vec<u8>) -> reqwest::Response {
+    router
+        .http
+        .post(format!("{}/v1/signal/{}", router.base, to.id()))
+        .header("ft-capability", capability)
+        .header("ft-call", "1")
+        .body(bytes)
+        .send()
+        .await
+        .expect("answers")
+}
+
+/// Mail, a signal and a call through `slot`, as a sender sees each answer.
+async fn write_signal_and_call(router: &Router, to: &Device, slot: usize) -> Vec<(u16, std::collections::BTreeMap<String, String>)> {
+    vec![
+        seen(deposit(router, to, slot_capability(to, slot), b"sealed".to_vec()).await).await,
+        seen(signal(router, to, slot_capability(to, slot), b"offer".to_vec()).await).await,
+        seen(call(router, to, slot_capability(to, slot), b"call offer".to_vec()).await).await,
+    ]
+}
+
+// A silent slot gets no push at all, on FCM or APNs, for mail, a signal or a call; and the sender
+// gets exactly the answers it gets when the push goes out: the mail is kept, the signal and the
+// call wait for the phone, as ever.
+#[tokio::test]
+async fn a_silent_slot_gets_no_push_and_the_sender_cannot_tell() {
+    let (android, iphones) = (Arc::new(FakeWaker::default()), Arc::new(FakeApns::default()));
+    let router = router_with(push_paced(android.clone(), iphones.clone(), Duration::ZERO)).await;
+    // Bob (Android) and Carol (iPhone) left the session in slot 3; Dave and Erin did not.
+    let (bob, carol, dave, erin) = (Device::new(2), Device::new(3), Device::new(4), Device::new(5));
+    for (device, silent) in [(&bob, 0b0000_1000), (&carol, 0b0000_1000), (&dave, 0), (&erin, 0)] {
+        assert_eq!(device.register_silent(&router, json!(silent)).await.status(), 204);
+    }
+    bob.set_push(&router, "bob-fcm-token").await;
+    dave.set_push(&router, "dave-fcm-token").await;
+    assert_eq!(carol.set_push_with(&router, "apns", &iphone_target(0xc0)).await.status(), 204);
+    assert_eq!(erin.set_push_with(&router, "apns", &iphone_target(0xe0)).await.status(), 204);
+
+    let to_bob = write_signal_and_call(&router, &bob, 3).await;
+    let to_carol = write_signal_and_call(&router, &carol, 3).await;
+    let to_dave = write_signal_and_call(&router, &dave, 3).await;
+    let to_erin = write_signal_and_call(&router, &erin, 3).await;
+
+    assert_eq!(to_bob, to_dave, "an Android phone: the same answers, push or no push");
+    assert_eq!(to_carol, to_erin, "an iPhone: the same answers, push or no push");
+    assert_eq!(to_bob.iter().map(|(status, _)| *status).collect::<Vec<_>>(), [201, 404, 404]);
+    assert_eq!(to_bob[1].1.get("ft-retained").map(String::as_str), Some("1"));
+    assert_eq!(to_bob[2].1.get("ft-retained").map(String::as_str), Some("1"));
+
+    // The pushes for Dave and Erin went out; none for Bob or Carol.
+    assert!(soon(|| android.woken().len() == 2 && android.rung().len() == 1 && iphones.0.woken().len() == 3).await);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(android.woken(), ["dave-fcm-token", "dave-fcm-token"]);
+    assert_eq!(android.rung(), ["dave-fcm-token"]);
+    assert_eq!(iphones.0.woken(), [iphone_target(0xe0), iphone_target(0xe0), iphone_target(0xe0)], "Erin's wakes and call");
+
+    // What came for the silent slot is still there: the mail in the mailbox, the signals waiting.
+    let listed: Value = bob.request(&router, "GET", "/v1/mailbox", vec![]).await.json().await.unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    let mut socket = carol.connect(&router).await;
+    assert_eq!(next_json(&mut socket).await["kind"], "welcome");
+    assert_eq!(next_signal(&mut socket).await, b"offer");
+    assert_eq!(next_signal(&mut socket).await, b"call offer");
+}
+
+// Only the slots the phone named are silent: a spare slot without its bit still wakes and rings,
+// and the main list always does, even when the phone sets every bit.
+#[tokio::test]
+async fn other_slots_and_the_main_list_still_wake_and_ring() {
+    let android = Arc::new(FakeWaker::default());
+    let router = router_with(push_paced(android.clone(), Arc::default(), Duration::ZERO)).await;
+    let (bob, carol) = (Device::new(2), Device::new(3));
+    bob.register_silent(&router, json!(0b0000_1000)).await;
+    carol.register_silent(&router, json!(255)).await;
+    bob.set_push(&router, "bob-fcm-token").await;
+    carol.set_push(&router, "carol-fcm-token").await;
+
+    deposit(&router, &bob, slot_capability(&bob, 5), b"sealed".to_vec()).await;
+    assert!(soon(|| android.slots() == [5]).await, "slot 5 is not silent");
+    call(&router, &bob, slot_capability(&bob, 6), b"call offer".to_vec()).await;
+    assert!(soon(|| android.rung_slots() == [6]).await, "nor is slot 6");
+
+    deposit(&router, &carol, carol.capability(), b"sealed".to_vec()).await;
+    assert!(soon(|| android.slots() == [5, 0]).await, "the main list wakes");
+    call(&router, &carol, carol.capability(), b"call offer".to_vec()).await;
+    assert!(soon(|| android.rung_slots() == [6, 0]).await, "and rings");
+    deposit(&router, &carol, slot_capability(&carol, 7), b"sealed".to_vec()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(android.slots(), [5, 0], "but every other slot of hers is silent");
+}
+
+// Leaving a session silences it, coming back to it lets it ring again, and leaving again
+// silences it again: the latest registration decides.
+#[tokio::test]
+async fn coming_back_to_a_session_lets_it_ring_again() {
+    let android = Arc::new(FakeWaker::default());
+    let router = router_with(push_paced(android.clone(), Arc::default(), Duration::ZERO)).await;
+    let bob = Device::new(2);
+    bob.register_silent(&router, json!(0b0000_1000)).await;
+    bob.set_push(&router, "bob-fcm-token").await;
+
+    deposit(&router, &bob, slot_capability(&bob, 3), b"sealed".to_vec()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(android.woken().is_empty(), "silent");
+
+    bob.register_silent(&router, json!(0)).await;
+    deposit(&router, &bob, slot_capability(&bob, 3), b"sealed".to_vec()).await;
+    assert!(soon(|| android.slots() == [3]).await, "back in the session: it wakes");
+    call(&router, &bob, slot_capability(&bob, 3), b"call offer".to_vec()).await;
+    assert!(soon(|| android.rung_slots() == [3]).await, "and rings");
+
+    bob.register_silent(&router, json!(0b0000_1000)).await;
+    deposit(&router, &bob, slot_capability(&bob, 3), b"sealed".to_vec()).await;
+    call(&router, &bob, slot_capability(&bob, 3), b"call offer".to_vec()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!((android.slots(), android.rung_slots()), (vec![3], vec![3]), "left again: silent again");
+}
+
+// Each capability keeps its own pace (app#9), silent or not: a silent slot never holds back the
+// main list or another slot, and the pace of a slot is taken the same way whether its push goes
+// out or not, so nothing about it depends on the mask.
+#[tokio::test]
+async fn a_silent_slot_keeps_its_own_pace_and_holds_back_no_other() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_with(waker.clone())).await;
+    let bob = Device::new(2);
+    bob.register_silent(&router, json!(0b0000_1000)).await;
+    bob.set_push(&router, "bob-fcm-token").await;
+
+    deposit(&router, &bob, slot_capability(&bob, 3), b"sealed".to_vec()).await;
+    deposit(&router, &bob, bob.capability(), b"sealed".to_vec()).await;
+    assert!(soon(|| waker.slots() == [0]).await);
+    deposit(&router, &bob, slot_capability(&bob, 5), b"sealed".to_vec()).await;
+    assert!(soon(|| waker.slots() == [0, 5]).await);
+
+    // Back in slot 3 within the pace: its last push was skipped, not sent, yet the pace was taken
+    // all the same, exactly as for a push that went out.
+    bob.register_silent(&router, json!(0)).await;
+    deposit(&router, &bob, slot_capability(&bob, 3), b"sealed".to_vec()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(waker.slots(), [0, 5]);
 }
