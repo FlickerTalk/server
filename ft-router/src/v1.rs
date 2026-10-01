@@ -212,6 +212,10 @@ struct Registration {
     /// Eight capabilities, always eight (app#9); apps from before send only the one above.
     #[serde(default)]
     capability_hashes: Option<Vec<String>>,
+    /// Which slots are silent (2026-10-01): bit i set means slot i, a session the user has left,
+    /// gets no push. An integer 0–255, anything else is refused; absent (apps from before) is 0.
+    #[serde(default)]
+    silent_slots: u8,
 }
 
 async fn register(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: Bytes) -> Result<StatusCode, StatusCode> {
@@ -229,7 +233,9 @@ async fn register(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: Bytes) 
     };
     let device =
         authenticate(&hub, "POST", "/v1/device/register", Signature::from_headers(&headers), &body, Some(key)).await?;
-    hub.db.register(&device, &key, &hash, 0).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // The main list always rings: its bit is never kept.
+    let silent_slots = registration.silent_slots & !1;
+    hub.db.register(&device, &key, &hash, silent_slots).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if let Some(eight) = eight {
         hub.db.set_capabilities(&device, &eight).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     }

@@ -776,3 +776,79 @@ async fn forgetting_a_device_drops_what_waits_for_it() {
     next_json(&mut socket).await;
     assert!(nothing_more(&mut socket).await);
 }
+
+// ---- Silent slots (2026-10-01) ----
+//
+// A session the user has left is silent: the phone says which of its eight slots are (a bitmask,
+// bit i = slot i) and the router sends no push for them, because an iPhone shows an APNs alert
+// and rings a VoIP push whatever the app decides.
+
+impl Device {
+    /// Registers the eight capabilities with `silent_slots` as given, any JSON at all.
+    async fn register_silent(&self, router: &Router, silent_slots: Value) -> reqwest::Response {
+        let hashes: Vec<String> =
+            eight(self).iter().map(|capability| STANDARD_NO_PAD.encode(blake3::hash(capability).as_bytes())).collect();
+        let body = json!({
+            "signing_key": STANDARD_NO_PAD.encode(self.key.verifying_key().to_bytes()),
+            "capability_hash": hashes[0],
+            "capability_hashes": hashes,
+            "silent_slots": silent_slots,
+        });
+        self.request(router, "POST", "/v1/device/register", serde_json::to_vec(&body).unwrap()).await
+    }
+}
+
+/// The capability of one of the eight slots, as a sender holds it.
+fn slot_capability(device: &Device, slot: usize) -> String {
+    STANDARD_NO_PAD.encode(eight(device)[slot])
+}
+
+// An app from before sends no mask: nothing is silent, as ever.
+#[tokio::test]
+async fn a_registration_without_silent_slots_leaves_nothing_silent() {
+    let router = router().await;
+    let bob = Device::new(2);
+    assert_eq!(bob.register_eight(&router).await.status(), 204);
+    assert_eq!(router.db.silent_slots(&bob.id()).await.unwrap(), Some(0));
+    assert_eq!(bob.register(&router).await.status(), 204, "nor with a single capability");
+    assert_eq!(router.db.silent_slots(&bob.id()).await.unwrap(), Some(0));
+}
+
+// The main list (bit 0) can never be silenced: the router clears its bit.
+#[tokio::test]
+async fn a_registration_carries_the_silent_slots_but_never_the_main_list() {
+    let router = router().await;
+    let bob = Device::new(2);
+    assert_eq!(bob.register_silent(&router, json!(0b1000_0111)).await.status(), 204);
+    assert_eq!(router.db.silent_slots(&bob.id()).await.unwrap(), Some(0b1000_0110));
+    let carol = Device::new(3);
+    assert_eq!(carol.register_silent(&router, json!(255)).await.status(), 204);
+    assert_eq!(router.db.silent_slots(&carol.id()).await.unwrap(), Some(0b1111_1110));
+}
+
+// Like any other malformed registration: 400, and nothing is stored.
+#[tokio::test]
+async fn malformed_silent_slots_are_refused() {
+    let router = router().await;
+    let bob = Device::new(2);
+    for wrong in [json!(256), json!(-1), json!(1.5), json!(2.0), json!("6"), json!(null), json!(true), json!([1]), json!({})] {
+        assert_eq!(bob.register_silent(&router, wrong.clone()).await.status(), 400, "{wrong}");
+    }
+    assert!(router.db.signing_key(&bob.id()).await.unwrap().is_none(), "never registered");
+}
+
+// Leaving a session and coming back to it: each registration replaces the mask, and one without
+// the field clears it.
+#[tokio::test]
+async fn each_registration_replaces_the_silent_slots() {
+    let router = router().await;
+    let bob = Device::new(2);
+    bob.register_silent(&router, json!(0b0000_1000)).await;
+    assert_eq!(router.db.silent_slots(&bob.id()).await.unwrap(), Some(0b0000_1000));
+    bob.register_silent(&router, json!(0)).await;
+    assert_eq!(router.db.silent_slots(&bob.id()).await.unwrap(), Some(0));
+    bob.register_silent(&router, json!(0b0010_1000)).await;
+    assert_eq!(router.db.silent_slots(&bob.id()).await.unwrap(), Some(0b0010_1000));
+    bob.register_eight(&router).await;
+    assert_eq!(router.db.silent_slots(&bob.id()).await.unwrap(), Some(0), "absent is 0");
+}
