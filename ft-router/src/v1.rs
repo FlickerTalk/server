@@ -3,7 +3,9 @@
 //! - `POST /v1/device/register`: signed with the key being registered; stores that key and the
 //!   hash of the route capability. The app registers on every start. Since 0.5.0 it may carry
 //!   `silent_slots` (0–255, bit i = slot i): no push goes out for those slots, sessions the user
-//!   has left; slot 0, the main list, always gets them. Each registration replaces the mask.
+//!   has left; slot 0, the main list, always gets them. Each registration replaces the mask. Since
+//!   0.6.0 a silent slot is unreachable, not only quiet (see below); a registration that clears a
+//!   bit makes that slot's withheld mail collectable and tells a connected device.
 //! - `GET /v1/connect`: signed WebSocket. The router sends a welcome (STUN and a temporary TURN
 //!   user), the signals addressed to the device and a notice when mail arrives.
 //! - `POST /v1/signal/{to}`: needs the recipient's capability. `202` when the recipient is
@@ -14,8 +16,13 @@
 //!   dropped first). The status stays `404` on purpose: apps before 0.4 read `202` as "connected"
 //!   and would wait for a data channel before falling back to the mailbox; with `404` they go on as
 //!   they did, and a sender that knows the header keeps its offer open and waits for the answer.
+//!   A signal through a silent slot (0.6.0) never reaches the device, connected or not: it is
+//!   neither forwarded nor held, and the sender gets the same `404` with `ft-retained: 1`. A held
+//!   signal keeps its slot, and one whose slot has become silent by the hand-over is dropped.
 //! - `POST /v1/mailbox/{to}`: needs the recipient's capability, not the sender's identity: the
-//!   router does not learn who writes to whom through the mailbox.
+//!   router does not learn who writes to whom through the mailbox. Each blob keeps the slot it
+//!   came through (0.6.0): mail through a silent slot is kept, with the same answer, but neither
+//!   announced nor collectable until a registration clears that slot's bit.
 //! - `GET /v1/mailbox`, `DELETE /v1/mailbox/{id}`: signed by the owner.
 //! - `GET /v1/turn-credentials`, `DELETE /v1/device`: signed.
 //! - `PUT /v1/device/push`, `DELETE /v1/device/push`: signed; where the device can be woken, kept
@@ -46,9 +53,9 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::auth::{self, decode_base64, ReplayGuard, SignedRequest, STANDARD_NO_PAD};
-use crate::db::{Db, MAX_BLOB};
+use crate::db::{Db, Route, MAX_BLOB};
 use crate::limits::{Limiters, Limits};
-use crate::push::{Push, Wake, MAX_TOKEN};
+use crate::push::{silent, Push, Wake, MAX_TOKEN};
 use crate::turn::TurnIssuer;
 use crate::waiting::{Retention, Waiting, SWEEP_EVERY};
 
@@ -189,15 +196,15 @@ async fn authenticate(
 }
 
 /// The recipient's route capability must come with anything addressed to it (§34). Returns which
-/// of its capabilities it was (app#9).
-async fn check_capability(hub: &Hub, to: &str, headers: &HeaderMap) -> Result<u8, StatusCode> {
+/// of its capabilities it was (app#9), and whether that slot is silent (2026-10-01).
+async fn check_capability(hub: &Hub, to: &str, headers: &HeaderMap) -> Result<Route, StatusCode> {
     let capability = headers.get("ft-capability").and_then(|value| value.to_str().ok()).ok_or(StatusCode::FORBIDDEN)?;
     let capability: [u8; 32] = decode_base64(capability)
         .ok()
         .and_then(|bytes| bytes.try_into().ok())
         .ok_or(StatusCode::FORBIDDEN)?;
-    match hub.db.capability_slot(to, &capability).await {
-        Ok(Some(slot)) => Ok(slot),
+    match hub.db.route(to, &capability).await {
+        Ok(Some(route)) => Ok(route),
         Ok(None) => Err(StatusCode::FORBIDDEN),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
@@ -237,9 +244,16 @@ async fn register(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: Bytes) 
         authenticate(&hub, "POST", "/v1/device/register", Signature::from_headers(&headers), &body, Some(key)).await?;
     // The main list always rings: its bit is never kept.
     let silent_slots = registration.silent_slots & !1;
-    hub.db.register(&device, &key, &hash, silent_slots).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let before = hub.db.register(&device, &key, &hash, silent_slots).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if let Some(eight) = eight {
         hub.db.set_capabilities(&device, &eight).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+    // Sessions opened again (2026-10-01): the mail withheld for them is collectable now, and a
+    // connected phone hears of it as of any mail. A notice missed here costs nothing: the app
+    // collects whenever it connects.
+    let opened = before & !silent_slots;
+    if opened != 0 && matches!(hub.db.mail_through(&device, opened).await, Ok(true)) {
+        notify(&hub, &device, json!({ "kind": "mail" })).await;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -331,6 +345,12 @@ async fn connect(
 async fn serve(hub: Arc<Hub>, device: String, mut socket: WebSocket) {
     let (outbox, mut pending) = mpsc::unbounded_channel::<String>();
     {
+        // What came through a session the user has left since it was held is dropped, not handed
+        // over (2026-10-01). Should the mask be unreadable, only the main list's signals go.
+        let silent_slots = match hub.db.silent_slots(&device).await {
+            Ok(Some(mask)) => mask,
+            _ => !1,
+        };
         // A newer connection of the same device replaces the older one. What waited for the
         // device goes first, in order: signals sent from now on queue behind it.
         let mut online = hub.online.lock().await;
@@ -339,8 +359,10 @@ async fn serve(hub: Arc<Hub>, device: String, mut socket: WebSocket) {
         if let Some(push) = &hub.push {
             push.ring_limiter.picked_up(&device);
         }
-        for signal in hub.waiting.take(&device, Instant::now()) {
-            let _ = outbox.send(signal_frame(&signal));
+        for (slot, signal) in hub.waiting.take(&device, Instant::now()) {
+            if !silent(silent_slots, slot) {
+                let _ = outbox.send(signal_frame(&signal));
+            }
         }
     }
 
@@ -382,8 +404,8 @@ async fn signal(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: He
     if let Err(status) = hub.limit_origin(&headers) {
         return status.into_response();
     }
-    let slot = match check_capability(&hub, &to, &headers).await {
-        Ok(slot) => slot,
+    let route = match check_capability(&hub, &to, &headers).await {
+        Ok(route) => route,
         Err(status) => return status.into_response(),
     };
     if let Err(status) = hub.limit_recipient(&to) {
@@ -392,17 +414,22 @@ async fn signal(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: He
     if body.len() > MAX_SIGNAL {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     }
-    {
+    // A silent slot is a session the user has left (2026-10-01): its signal never reaches the
+    // device, connected or not. It is not held either, so nothing sent while the session was left
+    // is handed over once the user comes back to it; a sender that still wants through sends again,
+    // as it does for a phone that stayed off. The sender gets the answer of a phone that is not
+    // connected, and the push path below is taken the same way (it sends nothing for a silent slot).
+    if !route.silent {
         let online = hub.online.lock().await;
         if online.get(&to).is_some_and(|outbox| outbox.send(signal_frame(&body)).is_ok()) {
             return StatusCode::ACCEPTED.into_response();
         }
-        hub.waiting.hold(&to, body.to_vec(), Instant::now());
+        hub.waiting.hold(&to, route.slot, body.to_vec(), Instant::now());
     }
     // The caller says a signal is a call (2026-09-28): an iPhone rings through CallKit. That it
     // is a call is all the router learns; not who, nor voice or video.
     let call = headers.get("ft-call").is_some_and(|value| value == "1");
-    wake_as(&hub, &to, slot, call);
+    wake_as(&hub, &to, route.slot, call);
     (StatusCode::NOT_FOUND, [("ft-retained", "1")]).into_response()
 }
 
@@ -410,8 +437,8 @@ async fn deposit(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: H
     if let Err(status) = hub.limit_origin(&headers) {
         return status;
     }
-    let slot = match check_capability(&hub, &to, &headers).await {
-        Ok(slot) => slot,
+    let route = match check_capability(&hub, &to, &headers).await {
+        Ok(route) => route,
         Err(status) => return status,
     };
     if let Err(status) = hub.limit_recipient(&to) {
@@ -420,10 +447,13 @@ async fn deposit(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: H
     if body.len() > MAX_BLOB {
         return StatusCode::PAYLOAD_TOO_LARGE;
     }
-    match hub.db.deposit(&to, &body, MAILBOX_TTL).await {
+    match hub.db.deposit(&to, route.slot, &body, MAILBOX_TTL).await {
         Ok(_) => {
-            if !notify(&hub, &to, json!({ "kind": "mail" })).await {
-                wake(&hub, &to, slot);
+            // Mail through a silent slot (2026-10-01) is kept but withheld: the phone hears nothing
+            // of it, open or closed, and the push path is taken as for a phone that is not
+            // connected (it sends nothing for a silent slot). The sender's answer is the same.
+            if route.silent || !notify(&hub, &to, json!({ "kind": "mail" })).await {
+                wake(&hub, &to, route.slot);
             }
             StatusCode::CREATED
         }
