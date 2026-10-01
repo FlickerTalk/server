@@ -14,6 +14,8 @@
 //!   dropped first). The status stays `404` on purpose: apps before 0.4 read `202` as "connected"
 //!   and would wait for a data channel before falling back to the mailbox; with `404` they go on as
 //!   they did, and a sender that knows the header keeps its offer open and waits for the answer.
+//!   A signal through a silent slot (0.6.0) never reaches the device, connected or not: it is
+//!   neither forwarded nor held, and the sender gets the same `404` with `ft-retained: 1`.
 //! - `POST /v1/mailbox/{to}`: needs the recipient's capability, not the sender's identity: the
 //!   router does not learn who writes to whom through the mailbox.
 //! - `GET /v1/mailbox`, `DELETE /v1/mailbox/{id}`: signed by the owner.
@@ -46,7 +48,7 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::auth::{self, decode_base64, ReplayGuard, SignedRequest, STANDARD_NO_PAD};
-use crate::db::{Db, MAX_BLOB};
+use crate::db::{Db, Route, MAX_BLOB};
 use crate::limits::{Limiters, Limits};
 use crate::push::{Push, Wake, MAX_TOKEN};
 use crate::turn::TurnIssuer;
@@ -189,15 +191,15 @@ async fn authenticate(
 }
 
 /// The recipient's route capability must come with anything addressed to it (§34). Returns which
-/// of its capabilities it was (app#9).
-async fn check_capability(hub: &Hub, to: &str, headers: &HeaderMap) -> Result<u8, StatusCode> {
+/// of its capabilities it was (app#9), and whether that slot is silent (2026-10-01).
+async fn check_capability(hub: &Hub, to: &str, headers: &HeaderMap) -> Result<Route, StatusCode> {
     let capability = headers.get("ft-capability").and_then(|value| value.to_str().ok()).ok_or(StatusCode::FORBIDDEN)?;
     let capability: [u8; 32] = decode_base64(capability)
         .ok()
         .and_then(|bytes| bytes.try_into().ok())
         .ok_or(StatusCode::FORBIDDEN)?;
-    match hub.db.capability_slot(to, &capability).await {
-        Ok(Some(slot)) => Ok(slot),
+    match hub.db.route(to, &capability).await {
+        Ok(Some(route)) => Ok(route),
         Ok(None) => Err(StatusCode::FORBIDDEN),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
@@ -382,8 +384,8 @@ async fn signal(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: He
     if let Err(status) = hub.limit_origin(&headers) {
         return status.into_response();
     }
-    let slot = match check_capability(&hub, &to, &headers).await {
-        Ok(slot) => slot,
+    let route = match check_capability(&hub, &to, &headers).await {
+        Ok(route) => route,
         Err(status) => return status.into_response(),
     };
     if let Err(status) = hub.limit_recipient(&to) {
@@ -392,7 +394,12 @@ async fn signal(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: He
     if body.len() > MAX_SIGNAL {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     }
-    {
+    // A silent slot is a session the user has left (2026-10-01): its signal never reaches the
+    // device, connected or not. It is not held either, so nothing sent while the session was left
+    // is handed over once the user comes back to it; a sender that still wants through sends again,
+    // as it does for a phone that stayed off. The sender gets the answer of a phone that is not
+    // connected, and the push path below is taken the same way (it sends nothing for a silent slot).
+    if !route.silent {
         let online = hub.online.lock().await;
         if online.get(&to).is_some_and(|outbox| outbox.send(signal_frame(&body)).is_ok()) {
             return StatusCode::ACCEPTED.into_response();
@@ -402,7 +409,7 @@ async fn signal(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: He
     // The caller says a signal is a call (2026-09-28): an iPhone rings through CallKit. That it
     // is a call is all the router learns; not who, nor voice or video.
     let call = headers.get("ft-call").is_some_and(|value| value == "1");
-    wake_as(&hub, &to, slot, call);
+    wake_as(&hub, &to, route.slot, call);
     (StatusCode::NOT_FOUND, [("ft-retained", "1")]).into_response()
 }
 
@@ -410,10 +417,11 @@ async fn deposit(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: H
     if let Err(status) = hub.limit_origin(&headers) {
         return status;
     }
-    let slot = match check_capability(&hub, &to, &headers).await {
-        Ok(slot) => slot,
+    let route = match check_capability(&hub, &to, &headers).await {
+        Ok(route) => route,
         Err(status) => return status,
     };
+    let slot = route.slot;
     if let Err(status) = hub.limit_recipient(&to) {
         return status;
     }
