@@ -1457,3 +1457,31 @@ async fn a_full_session_answers_like_a_full_mailbox_and_holds_back_no_other() {
     assert_eq!(deposit(&router, &bob, slot_capability(&bob, 5), b"five".to_vec()).await.status(), 201, "another session");
     assert_eq!(blobs(&collected(&router, &bob).await), [b"main".as_slice(), b"five"]);
 }
+
+// A signal retained while its slot was not silent is not handed over if the user leaves that
+// session before the phone connects: at hand-over, what came through a slot silent at that moment
+// is dropped; the other slots' signals arrive as ever.
+#[tokio::test]
+async fn a_retained_signal_is_dropped_if_its_session_was_left_before_the_hand_over() {
+    let router = router().await;
+    let bob = Device::new(2);
+    bob.register_silent(&router, json!(0)).await;
+    assert_eq!(signal(&router, &bob, slot_capability(&bob, 3), b"to three".to_vec()).await.status(), 404);
+    assert_eq!(signal(&router, &bob, slot_capability(&bob, 5), b"to five".to_vec()).await.status(), 404);
+    assert_eq!(call(&router, &bob, bob.capability(), b"to the main list".to_vec()).await.status(), 404);
+
+    bob.register_silent(&router, json!(0b0000_1000)).await;
+    let mut socket = bob.connect(&router).await;
+    assert_eq!(next_json(&mut socket).await["kind"], "welcome");
+    assert_eq!(next_signal(&mut socket).await, b"to five");
+    assert_eq!(next_signal(&mut socket).await, b"to the main list");
+    assert!(nothing_more(&mut socket).await, "not the one through slot 3");
+    socket.close(None).await.expect("closes");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Dropped, not kept aside: coming back to the session does not bring it back.
+    bob.register_silent(&router, json!(0)).await;
+    let mut socket = bob.connect(&router).await;
+    assert_eq!(next_json(&mut socket).await["kind"], "welcome");
+    assert!(nothing_more(&mut socket).await);
+}

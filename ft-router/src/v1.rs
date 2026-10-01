@@ -17,7 +17,8 @@
 //!   and would wait for a data channel before falling back to the mailbox; with `404` they go on as
 //!   they did, and a sender that knows the header keeps its offer open and waits for the answer.
 //!   A signal through a silent slot (0.6.0) never reaches the device, connected or not: it is
-//!   neither forwarded nor held, and the sender gets the same `404` with `ft-retained: 1`.
+//!   neither forwarded nor held, and the sender gets the same `404` with `ft-retained: 1`. A held
+//!   signal keeps its slot, and one whose slot has become silent by the hand-over is dropped.
 //! - `POST /v1/mailbox/{to}`: needs the recipient's capability, not the sender's identity: the
 //!   router does not learn who writes to whom through the mailbox. Each blob keeps the slot it
 //!   came through (0.6.0): mail through a silent slot is kept, with the same answer, but neither
@@ -54,7 +55,7 @@ use tokio::sync::{mpsc, Mutex};
 use crate::auth::{self, decode_base64, ReplayGuard, SignedRequest, STANDARD_NO_PAD};
 use crate::db::{Db, Route, MAX_BLOB};
 use crate::limits::{Limiters, Limits};
-use crate::push::{Push, Wake, MAX_TOKEN};
+use crate::push::{silent, Push, Wake, MAX_TOKEN};
 use crate::turn::TurnIssuer;
 use crate::waiting::{Retention, Waiting, SWEEP_EVERY};
 
@@ -344,6 +345,12 @@ async fn connect(
 async fn serve(hub: Arc<Hub>, device: String, mut socket: WebSocket) {
     let (outbox, mut pending) = mpsc::unbounded_channel::<String>();
     {
+        // What came through a session the user has left since it was held is dropped, not handed
+        // over (2026-10-01). Should the mask be unreadable, only the main list's signals go.
+        let silent_slots = match hub.db.silent_slots(&device).await {
+            Ok(Some(mask)) => mask,
+            _ => !1,
+        };
         // A newer connection of the same device replaces the older one. What waited for the
         // device goes first, in order: signals sent from now on queue behind it.
         let mut online = hub.online.lock().await;
@@ -352,8 +359,10 @@ async fn serve(hub: Arc<Hub>, device: String, mut socket: WebSocket) {
         if let Some(push) = &hub.push {
             push.ring_limiter.picked_up(&device);
         }
-        for signal in hub.waiting.take(&device, Instant::now()) {
-            let _ = outbox.send(signal_frame(&signal));
+        for (slot, signal) in hub.waiting.take(&device, Instant::now()) {
+            if !silent(silent_slots, slot) {
+                let _ = outbox.send(signal_frame(&signal));
+            }
         }
     }
 
@@ -415,7 +424,7 @@ async fn signal(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: He
         if online.get(&to).is_some_and(|outbox| outbox.send(signal_frame(&body)).is_ok()) {
             return StatusCode::ACCEPTED.into_response();
         }
-        hub.waiting.hold(&to, body.to_vec(), Instant::now());
+        hub.waiting.hold(&to, route.slot, body.to_vec(), Instant::now());
     }
     // The caller says a signal is a call (2026-09-28): an iPhone rings through CallKit. That it
     // is a call is all the router learns; not who, nor voice or video.
