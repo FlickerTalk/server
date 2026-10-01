@@ -11,8 +11,12 @@ use uuid::Uuid;
 
 /// Largest blob a mailbox accepts: an encrypted text message is far smaller.
 pub const MAX_BLOB: usize = 64 * 1024;
-/// Blobs waiting per device at most; beyond that, senders keep the message on their phone.
-pub const MAX_BLOBS_PER_DEVICE: i64 = 1000;
+/// Blobs waiting through the main list (slot 0) at most; beyond that, senders keep the message on
+/// their phone.
+pub const MAX_BLOBS_MAIN_LIST: i64 = 1000;
+/// Blobs waiting through each of slots 1–7 at most (2026-10-01): each session has its own share,
+/// so a session the user has left, whose mail is withheld and never collected, fills only its own.
+pub const MAX_BLOBS_PER_SESSION: i64 = 200;
 
 pub struct Db {
     pool: PgPool,
@@ -173,17 +177,19 @@ impl Db {
     }
 
     /// Keeps a blob that came through `slot` (0–7), withheld from the device while that slot is
-    /// silent (2026-10-01). The quota counts every blob waiting, withheld or not.
+    /// silent (2026-10-01). Each slot has its own quota, counting every blob of that slot still
+    /// waiting, withheld or not; silent or not, a full slot refuses the same way.
     pub async fn deposit(&self, device_id: &str, slot: u8, blob: &[u8], ttl: Duration) -> Result<Uuid> {
         if blob.len() > MAX_BLOB {
             bail!("the blob is too large");
         }
-        let waiting: i64 = sqlx::query("SELECT COUNT(*) AS n FROM mailbox WHERE device_id = $1 AND expires_at > now()")
+        let waiting: i64 = sqlx::query("SELECT COUNT(*) AS n FROM mailbox WHERE device_id = $1 AND slot = $2 AND expires_at > now()")
             .bind(device_id)
+            .bind(i16::from(slot))
             .fetch_one(&self.pool)
             .await?
             .get("n");
-        if waiting >= MAX_BLOBS_PER_DEVICE {
+        if waiting >= quota(slot) {
             bail!("the mailbox is full");
         }
         let id = Uuid::now_v7();
@@ -245,6 +251,15 @@ impl Db {
             .fetch_one(&self.pool)
             .await?;
         Ok(row.get("p"))
+    }
+}
+
+/// How many unexpired blobs may wait through `slot`.
+fn quota(slot: u8) -> i64 {
+    if slot == 0 {
+        MAX_BLOBS_MAIN_LIST
+    } else {
+        MAX_BLOBS_PER_SESSION
     }
 }
 
@@ -340,7 +355,7 @@ mod tests {
     async fn a_mailbox_has_a_quota_and_blobs_a_maximum_size() {
         let db = db().await;
         assert!(db.deposit("ft_a", 0, &vec![0; MAX_BLOB + 1], Duration::from_secs(60)).await.is_err());
-        for _ in 0..MAX_BLOBS_PER_DEVICE {
+        for _ in 0..MAX_BLOBS_MAIN_LIST {
             db.deposit("ft_a", 0, b"x", Duration::from_secs(60)).await.expect("within the quota");
         }
         assert!(db.deposit("ft_a", 0, b"x", Duration::from_secs(60)).await.is_err());
@@ -434,6 +449,62 @@ mod tests {
     }
 
     // ---- A left session is unreachable (2026-10-01) ----
+
+    /// Fills `slot` of `device` up to `quota` blobs that last a minute.
+    async fn fill(db: &Db, device: &str, slot: u8, quota: i64) {
+        for _ in 0..quota {
+            db.deposit(device, slot, b"x", Duration::from_secs(60)).await.expect("within the quota");
+        }
+    }
+
+    // Each session has a share of its own, silent or not: a left session that fills up holds back
+    // neither the main list nor any other session.
+    #[tokio::test]
+    async fn a_session_that_fills_up_holds_back_no_other_slot() {
+        let db = db().await;
+        db.register("ft_a", &KEY, &capability_hash(), 0b0000_1000).await.expect("registers");
+        fill(&db, "ft_a", 3, MAX_BLOBS_PER_SESSION).await;
+        assert!(db.deposit("ft_a", 3, b"x", Duration::from_secs(60)).await.is_err(), "slot 3 is full");
+        db.deposit("ft_a", 0, b"main", Duration::from_secs(60)).await.expect("the main list is not");
+        db.deposit("ft_a", 5, b"five", Duration::from_secs(60)).await.expect("nor slot 5");
+
+        fill(&db, "ft_a", 5, MAX_BLOBS_PER_SESSION - 1).await;
+        assert!(db.deposit("ft_a", 5, b"x", Duration::from_secs(60)).await.is_err(), "a slot that is not silent fills the same way");
+    }
+
+    // The main list keeps the share it had for the whole device, and nothing in the sessions takes
+    // from it.
+    #[tokio::test]
+    async fn the_main_list_keeps_its_quota() {
+        assert_eq!(MAX_BLOBS_MAIN_LIST, 1000);
+        let db = db().await;
+        fill(&db, "ft_a", 6, MAX_BLOBS_PER_SESSION).await;
+        fill(&db, "ft_a", 0, MAX_BLOBS_MAIN_LIST).await;
+        assert!(db.deposit("ft_a", 0, b"x", Duration::from_secs(60)).await.is_err());
+    }
+
+    // Like the device's count before, a slot's count leaves out what has expired.
+    #[tokio::test]
+    async fn expired_blobs_do_not_count_against_a_slot() {
+        let db = db().await;
+        for _ in 0..MAX_BLOBS_PER_SESSION {
+            db.deposit("ft_a", 3, b"old", Duration::ZERO).await.expect("deposits");
+        }
+        db.deposit("ft_a", 3, b"new", Duration::from_secs(60)).await.expect("the expired ones do not count");
+    }
+
+    // Opening the session again and collecting what waited frees its share.
+    #[tokio::test]
+    async fn opening_the_session_and_collecting_frees_its_quota() {
+        let db = db().await;
+        db.register("ft_a", &KEY, &capability_hash(), 0b0000_1000).await.expect("registers");
+        fill(&db, "ft_a", 3, MAX_BLOBS_PER_SESSION).await;
+        assert!(db.deposit("ft_a", 3, b"x", Duration::from_secs(60)).await.is_err());
+        db.register("ft_a", &KEY, &capability_hash(), 0).await.expect("comes back");
+        let (id, _) = db.collect("ft_a").await.unwrap()[0].clone();
+        assert!(db.acknowledge("ft_a", id).await.unwrap());
+        db.deposit("ft_a", 3, b"x", Duration::from_secs(60)).await.expect("room again");
+    }
 
     /// The blobs `device` would collect now.
     async fn collectable(db: &Db, device: &str) -> Vec<Vec<u8>> {

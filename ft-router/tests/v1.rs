@@ -1431,3 +1431,29 @@ async fn mail_through_the_other_slots_is_collected_as_usual_meanwhile() {
     assert_eq!(next_json(&mut socket).await["kind"], "mail");
     assert_eq!(blobs(&collected(&router, &bob).await), [b"left".as_slice()]);
 }
+
+// Each session has its own share of the mailbox (2026-10-01): released apps deposit an undelivered
+// message again every ten minutes, and a left session's mail is never collected, so it must not
+// fill the main list's. A full slot answers as a full mailbox always has, silent or not, so the
+// sender cannot tell a left session from the full mailbox of a phone that is off.
+#[tokio::test]
+async fn a_full_session_answers_like_a_full_mailbox_and_holds_back_no_other() {
+    use ft_router::db::MAX_BLOBS_PER_SESSION;
+    let router = router_limited(limits(100_000, 100_000, 100_000)).await;
+    // Bob left the session in slot 3; Dave left nothing and is off.
+    let (bob, dave) = (Device::new(2), Device::new(4));
+    bob.register_silent(&router, json!(0b0000_1000)).await;
+    dave.register_silent(&router, json!(0)).await;
+    for _ in 0..MAX_BLOBS_PER_SESSION {
+        assert_eq!(deposit(&router, &bob, slot_capability(&bob, 3), b"again".to_vec()).await.status(), 201);
+        assert_eq!(deposit(&router, &dave, slot_capability(&dave, 3), b"again".to_vec()).await.status(), 201);
+    }
+    let to_bob = seen(deposit(&router, &bob, slot_capability(&bob, 3), b"one more".to_vec()).await).await;
+    let to_dave = seen(deposit(&router, &dave, slot_capability(&dave, 3), b"one more".to_vec()).await).await;
+    assert_eq!(to_bob, to_dave, "the sender cannot tell");
+    assert_eq!(to_bob.0, 507);
+
+    assert_eq!(deposit(&router, &bob, bob.capability(), b"main".to_vec()).await.status(), 201, "the main list");
+    assert_eq!(deposit(&router, &bob, slot_capability(&bob, 5), b"five".to_vec()).await.status(), 201, "another session");
+    assert_eq!(blobs(&collected(&router, &bob).await), [b"main".as_slice(), b"five"]);
+}
