@@ -4,7 +4,7 @@ use std::time::Duration;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use ft_router::db::Db;
-use ft_router::push::{Apns, Fcm, PushVault, ServiceAccount, Waker, WakeLimiter, APNS, FCM, WAKE_EVERY};
+use ft_router::push::{Apns, Fcm, PushVault, RingLimiter, ServiceAccount, Waker, WakeLimiter, APNS, FCM, RING_EVERY, RING_FOR, WAKE_EVERY};
 use ft_router::turn::TurnIssuer;
 use ft_router::{Config, Push};
 use tokio::net::TcpListener;
@@ -80,7 +80,12 @@ fn push_from(key: Option<Vec<u8>>, service_account: Option<Vec<u8>>, apns: Optio
     if wakers.is_empty() {
         return Ok(None);
     }
-    Ok(Some(Push { vault: PushVault::new(&key), wakers, limiter: WakeLimiter::new(WAKE_EVERY) }))
+    Ok(Some(Push {
+        vault: PushVault::new(&key),
+        wakers,
+        limiter: WakeLimiter::new(WAKE_EVERY),
+        ring_limiter: RingLimiter::new(RING_EVERY, RING_FOR),
+    }))
 }
 
 /// Expired mail is deleted every hour (§19).

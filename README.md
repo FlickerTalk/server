@@ -19,6 +19,13 @@ wakes the phone and holds the signal in memory (eight per phone and 32 MiB in al
 dropped first) to hand it over, in order and once, when the phone connects. Because it lives in
 memory, the router runs as a single replica.
 
+A caller marks a call's signal with `ft-call: 1`, and the phone is rung instead of woken. Wakes and
+rings are paced apart, per phone and routing code, so a message never holds back a call: a phone is
+woken at most once every 10 seconds, and after a ring the next one waits until the phone has
+connected and 10 seconds have passed, or until the ring has run out after 45 seconds: a call sent
+again before the phone has connected does not ring it twice. The paces live in memory only, and the
+sender gets the same answer whether a push went out or not.
+
 A phone registers eight routing codes, most of them unused, and may say which are silent
 (`silent_slots`, bit *i* for code *i*; the first, the main list, is never silent). Nothing is
 pushed for a silent code: mail for it is still kept and a signal still waits, and the sender gets
