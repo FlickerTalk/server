@@ -1328,3 +1328,106 @@ async fn without_silent_slots_every_slot_gets_its_signals() {
         assert_eq!(next_signal(&mut socket).await, [slot]);
     }
 }
+
+// ---- Mail through a left session waits for the user to open it again (2026-10-01) ----
+
+/// The blobs `device` collects now, decoded, with their ids.
+async fn collected(router: &Router, device: &Device) -> Vec<(String, Vec<u8>)> {
+    let listed: Value = device.request(router, "GET", "/v1/mailbox", vec![]).await.json().await.unwrap();
+    listed
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|blob| (blob["id"].as_str().unwrap().to_owned(), STANDARD_NO_PAD.decode(blob["blob"].as_str().unwrap()).unwrap()))
+        .collect()
+}
+
+fn blobs(collected: &[(String, Vec<u8>)]) -> Vec<&[u8]> {
+    collected.iter().map(|(_, blob)| blob.as_slice()).collect()
+}
+
+// Mail through a silent slot is taken exactly as any other (the same answer as for a phone that
+// left nothing), but the phone neither collects it nor hears of it, even with the app open, and
+// nothing is pushed.
+#[tokio::test]
+async fn mail_through_a_silent_slot_is_kept_without_a_word_to_the_device() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_with(waker.clone())).await;
+    let (bob, dave) = (Device::new(2), Device::new(4));
+    bob.register_silent(&router, json!(0b0000_1000)).await;
+    dave.register_silent(&router, json!(0)).await;
+    bob.set_push(&router, "bob-token").await;
+    let mut socket = bob.connect(&router).await;
+    assert_eq!(next_json(&mut socket).await["kind"], "welcome");
+
+    let to_bob = seen(deposit(&router, &bob, slot_capability(&bob, 3), b"left".to_vec()).await).await;
+    let to_dave = seen(deposit(&router, &dave, slot_capability(&dave, 3), b"sealed".to_vec()).await).await;
+    assert_eq!(to_bob, to_dave, "the sender cannot tell");
+    assert_eq!(to_bob.0, 201);
+
+    assert!(nothing_more(&mut socket).await, "no notice");
+    assert!(collected(&router, &bob).await.is_empty(), "not collectable");
+    assert!(waker.woken().is_empty(), "no push");
+}
+
+// Opening the session again (a registration that clears its bit) makes the mail collectable and
+// tells a connected phone; leaving it again withholds again what it has not acknowledged. A
+// registration that lets nothing new through says nothing.
+#[tokio::test]
+async fn opening_the_session_again_hands_its_mail_over_with_a_notice() {
+    let router = router().await;
+    let bob = Device::new(2);
+    bob.register_silent(&router, json!(0b0000_1000)).await;
+    let mut socket = bob.connect(&router).await;
+    assert_eq!(next_json(&mut socket).await["kind"], "welcome");
+
+    deposit(&router, &bob, slot_capability(&bob, 3), b"left".to_vec()).await;
+    bob.register_silent(&router, json!(0b0000_1000)).await;
+    bob.register_silent(&router, json!(0b0010_1000)).await;
+    assert!(nothing_more(&mut socket).await, "still silent: nothing to say");
+
+    bob.register_silent(&router, json!(0b0010_0000)).await;
+    assert_eq!(next_json(&mut socket).await["kind"], "mail", "slot 3 is open again");
+    assert_eq!(blobs(&collected(&router, &bob).await), [b"left".as_slice()]);
+
+    bob.register_silent(&router, json!(0b0000_1000)).await;
+    assert!(collected(&router, &bob).await.is_empty(), "left again before acknowledging: withheld again");
+    bob.register_silent(&router, json!(0)).await;
+    assert_eq!(next_json(&mut socket).await["kind"], "mail");
+    let again = collected(&router, &bob).await;
+    assert_eq!(blobs(&again), [b"left".as_slice()]);
+    assert_eq!(bob.request(&router, "DELETE", &format!("/v1/mailbox/{}", again[0].0), vec![]).await.status(), 204);
+
+    // Opening a session through which nothing waits says nothing.
+    bob.register_silent(&router, json!(0b0000_1000)).await;
+    bob.register_silent(&router, json!(0)).await;
+    assert!(nothing_more(&mut socket).await);
+}
+
+// Meanwhile the main list and the other slots are collected and announced as ever.
+#[tokio::test]
+async fn mail_through_the_other_slots_is_collected_as_usual_meanwhile() {
+    let router = router().await;
+    let bob = Device::new(2);
+    bob.register_silent(&router, json!(0b0000_1000)).await;
+    let mut socket = bob.connect(&router).await;
+    assert_eq!(next_json(&mut socket).await["kind"], "welcome");
+
+    deposit(&router, &bob, bob.capability(), b"main".to_vec()).await;
+    assert_eq!(next_json(&mut socket).await["kind"], "mail");
+    deposit(&router, &bob, slot_capability(&bob, 3), b"left".to_vec()).await;
+    deposit(&router, &bob, slot_capability(&bob, 5), b"five".to_vec()).await;
+    assert_eq!(next_json(&mut socket).await["kind"], "mail");
+    assert!(nothing_more(&mut socket).await, "one notice each, none for slot 3");
+
+    let now = collected(&router, &bob).await;
+    assert_eq!(blobs(&now), [b"main".as_slice(), b"five"]);
+    for (id, _) in &now {
+        assert_eq!(bob.request(&router, "DELETE", &format!("/v1/mailbox/{id}"), vec![]).await.status(), 204);
+    }
+    assert!(collected(&router, &bob).await.is_empty());
+
+    bob.register_silent(&router, json!(0)).await;
+    assert_eq!(next_json(&mut socket).await["kind"], "mail");
+    assert_eq!(blobs(&collected(&router, &bob).await), [b"left".as_slice()]);
+}
