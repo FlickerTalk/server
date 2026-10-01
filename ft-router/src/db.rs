@@ -26,12 +26,7 @@ impl Db {
 
     /// For tests: a fresh schema of its own in the given database.
     pub async fn connect_isolated(url: &str) -> Result<Self> {
-        let schema = format!("test_{}", Uuid::now_v7().simple());
-        let admin = PgPoolOptions::new().max_connections(1).connect(url).await?;
-        sqlx::query(AssertSqlSafe(format!("CREATE SCHEMA {schema}"))).execute(&admin).await?;
-        let options = PgConnectOptions::from_str(url)?.options([("search_path", schema.as_str())]);
-        let pool = PgPoolOptions::new().max_connections(4).connect_with(options).await?;
-        Self::migrated(pool).await
+        Self::migrated(isolated_pool(url).await?).await
     }
 
     async fn migrated(pool: PgPool) -> Result<Self> {
@@ -39,15 +34,18 @@ impl Db {
         Ok(Self { pool })
     }
 
-    /// Adds the device or refreshes its capability (the app registers on every start).
-    pub async fn register(&self, device_id: &str, signing_key: &[u8; 32], capability_hash: &[u8; 32]) -> Result<()> {
+    /// Adds the device or refreshes its capability (the app registers on every start). The silent
+    /// slots (2026-10-01) are replaced too: the mask stored is always the latest one sent.
+    pub async fn register(&self, device_id: &str, signing_key: &[u8; 32], capability_hash: &[u8; 32], silent_slots: u8) -> Result<()> {
         sqlx::query(
-            "INSERT INTO devices (device_id, signing_key, capability_hash) VALUES ($1, $2, $3)
-             ON CONFLICT (device_id) DO UPDATE SET capability_hash = excluded.capability_hash, updated_at = now()",
+            "INSERT INTO devices (device_id, signing_key, capability_hash, silent_slots) VALUES ($1, $2, $3, $4)
+             ON CONFLICT (device_id) DO UPDATE
+             SET capability_hash = excluded.capability_hash, silent_slots = excluded.silent_slots, updated_at = now()",
         )
         .bind(device_id)
         .bind(signing_key.as_slice())
         .bind(capability_hash.as_slice())
+        .bind(i16::from(silent_slots))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -131,6 +129,26 @@ impl Db {
         Ok(row.map(|row| (row.get("push_provider"), row.get("push_target"))))
     }
 
+    /// The provider and the encrypted token to wake the device through `slot`, unless the
+    /// device has no target or that slot is silent (2026-10-01). One query, silent or not.
+    pub async fn push_for(&self, device_id: &str, slot: u8) -> Result<Option<(String, Vec<u8>)>> {
+        let row = sqlx::query(
+            "SELECT push_provider, push_target, silent_slots FROM devices WHERE device_id = $1 AND push_target IS NOT NULL",
+        )
+        .bind(device_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row
+            .filter(|row| !crate::push::silent(row.get::<i16, _>("silent_slots") as u8, slot))
+            .map(|row| (row.get("push_provider"), row.get("push_target"))))
+    }
+
+    /// Which slots the device said are silent; None if it is not registered.
+    pub async fn silent_slots(&self, device_id: &str) -> Result<Option<u8>> {
+        let row = sqlx::query("SELECT silent_slots FROM devices WHERE device_id = $1").bind(device_id).fetch_optional(&self.pool).await?;
+        Ok(row.map(|row| row.get::<i16, _>("silent_slots") as u8))
+    }
+
     pub async fn deposit(&self, device_id: &str, blob: &[u8], ttl: Duration) -> Result<Uuid> {
         if blob.len() > MAX_BLOB {
             bail!("the blob is too large");
@@ -183,6 +201,15 @@ impl Db {
     }
 }
 
+/// A fresh schema of its own in the given database, not migrated yet.
+async fn isolated_pool(url: &str) -> Result<PgPool> {
+    let schema = format!("test_{}", Uuid::now_v7().simple());
+    let admin = PgPoolOptions::new().max_connections(1).connect(url).await?;
+    sqlx::query(AssertSqlSafe(format!("CREATE SCHEMA {schema}"))).execute(&admin).await?;
+    let options = PgConnectOptions::from_str(url)?.options([("search_path", schema.as_str())]);
+    Ok(PgPoolOptions::new().max_connections(4).connect_with(options).await?)
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -207,7 +234,7 @@ mod tests {
     async fn a_registered_device_is_known_by_its_key() {
         let db = db().await;
         assert!(db.signing_key("ft_a").await.unwrap().is_none());
-        db.register("ft_a", &KEY, &capability_hash()).await.expect("registers");
+        db.register("ft_a", &KEY, &capability_hash(), 0).await.expect("registers");
         assert_eq!(db.signing_key("ft_a").await.unwrap(), Some(KEY));
     }
 
@@ -215,9 +242,9 @@ mod tests {
     #[tokio::test]
     async fn registering_again_updates_the_capability() {
         let db = db().await;
-        db.register("ft_a", &KEY, &capability_hash()).await.expect("registers");
+        db.register("ft_a", &KEY, &capability_hash(), 0).await.expect("registers");
         let other = [3; 32];
-        db.register("ft_a", &KEY, blake3::hash(&other).as_bytes()).await.expect("re-registers");
+        db.register("ft_a", &KEY, blake3::hash(&other).as_bytes(), 0).await.expect("re-registers");
         assert!(db.capability_slot("ft_a", &other).await.unwrap().is_some());
         assert!(db.capability_slot("ft_a", &CAPABILITY).await.unwrap().is_none());
     }
@@ -225,7 +252,7 @@ mod tests {
     #[tokio::test]
     async fn only_the_right_capability_opens_the_route() {
         let db = db().await;
-        db.register("ft_a", &KEY, &capability_hash()).await.expect("registers");
+        db.register("ft_a", &KEY, &capability_hash(), 0).await.expect("registers");
         assert!(db.capability_slot("ft_a", &CAPABILITY).await.unwrap().is_some());
         assert!(db.capability_slot("ft_a", &[9; 32]).await.unwrap().is_none());
         assert!(db.capability_slot("ft_unknown", &CAPABILITY).await.unwrap().is_none());
@@ -280,10 +307,60 @@ mod tests {
         assert_eq!(db.persistence("devices").await.unwrap(), "p");
     }
 
+    // Silent slots (2026-10-01): every registration replaces the mask, so leaving a session and
+    // coming back to it both reach the router; a registration without one stores nothing silent.
+    #[tokio::test]
+    async fn each_registration_replaces_the_silent_slots() {
+        let db = db().await;
+        assert_eq!(db.silent_slots("ft_a").await.unwrap(), None, "not registered");
+        db.register("ft_a", &KEY, &capability_hash(), 0b0000_0110).await.expect("registers");
+        assert_eq!(db.silent_slots("ft_a").await.unwrap(), Some(0b0000_0110));
+        db.register("ft_a", &KEY, &capability_hash(), 0).await.expect("re-registers");
+        assert_eq!(db.silent_slots("ft_a").await.unwrap(), Some(0));
+        db.register("ft_a", &KEY, &capability_hash(), 0b1111_1110).await.expect("re-registers");
+        assert_eq!(db.silent_slots("ft_a").await.unwrap(), Some(0b1111_1110), "the whole byte");
+    }
+
+    // The wake path asks where to push for a given slot: nowhere when that slot is silent.
+    #[tokio::test]
+    async fn there_is_nowhere_to_push_for_a_silent_slot() {
+        let db = db().await;
+        db.register("ft_a", &KEY, &capability_hash(), 0b0000_1001).await.expect("registers");
+        assert!(db.push_for("ft_a", 3).await.unwrap().is_none(), "no target yet");
+        assert!(db.set_push("ft_a", "fcm", b"sealed").await.unwrap());
+        assert_eq!(db.push_for("ft_a", 3).await.unwrap(), None, "slot 3 is silent");
+        assert_eq!(db.push_for("ft_a", 2).await.unwrap(), Some(("fcm".to_owned(), b"sealed".to_vec())));
+        assert_eq!(db.push_for("ft_a", 0).await.unwrap(), Some(("fcm".to_owned(), b"sealed".to_vec())), "the main list always");
+        assert!(db.push_for("ft_unknown", 0).await.unwrap().is_none());
+    }
+
+    // The column comes with a migration on a database that already has devices: they keep working
+    // and nothing of theirs is silent.
+    #[tokio::test]
+    async fn the_silent_slots_migration_applies_to_an_existing_database() {
+        let url = std::env::var("FT_TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:test@127.0.0.1:55432/ft_router_test".to_owned());
+        let pool = isolated_pool(&url).await.expect("a fresh schema");
+        // The database as router 0.4.0 left it, with a device and its push target.
+        sqlx::migrate!("./migrations").run_to(3, &pool).await.expect("migrates up to 0003");
+        sqlx::query("INSERT INTO devices (device_id, signing_key, capability_hash, push_provider, push_target) VALUES ('ft_old', $1, $2, 'fcm', $3)")
+            .bind(KEY.as_slice())
+            .bind(capability_hash().as_slice())
+            .bind(b"sealed".as_slice())
+            .execute(&pool)
+            .await
+            .expect("an existing device");
+
+        let db = Db::migrated(pool).await.expect("migrates the rest");
+        assert_eq!(db.silent_slots("ft_old").await.unwrap(), Some(0));
+        assert_eq!(db.push_for("ft_old", 5).await.unwrap(), Some(("fcm".to_owned(), b"sealed".to_vec())));
+        assert_eq!(db.signing_key("ft_old").await.unwrap(), Some(KEY));
+    }
+
     #[tokio::test]
     async fn forgetting_a_device_removes_its_registration_and_mail() {
         let db = db().await;
-        db.register("ft_a", &KEY, &capability_hash()).await.expect("registers");
+        db.register("ft_a", &KEY, &capability_hash(), 0).await.expect("registers");
         db.deposit("ft_a", b"one", Duration::from_secs(60)).await.expect("deposits");
         db.forget("ft_a").await.expect("forgets");
         assert!(db.signing_key("ft_a").await.unwrap().is_none());
