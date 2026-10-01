@@ -3,7 +3,9 @@
 //! - `POST /v1/device/register`: signed with the key being registered; stores that key and the
 //!   hash of the route capability. The app registers on every start. Since 0.5.0 it may carry
 //!   `silent_slots` (0–255, bit i = slot i): no push goes out for those slots, sessions the user
-//!   has left; slot 0, the main list, always gets them. Each registration replaces the mask.
+//!   has left; slot 0, the main list, always gets them. Each registration replaces the mask. Since
+//!   0.6.0 a silent slot is unreachable, not only quiet (see below); a registration that clears a
+//!   bit makes that slot's withheld mail collectable and tells a connected device.
 //! - `GET /v1/connect`: signed WebSocket. The router sends a welcome (STUN and a temporary TURN
 //!   user), the signals addressed to the device and a notice when mail arrives.
 //! - `POST /v1/signal/{to}`: needs the recipient's capability. `202` when the recipient is
@@ -17,7 +19,9 @@
 //!   A signal through a silent slot (0.6.0) never reaches the device, connected or not: it is
 //!   neither forwarded nor held, and the sender gets the same `404` with `ft-retained: 1`.
 //! - `POST /v1/mailbox/{to}`: needs the recipient's capability, not the sender's identity: the
-//!   router does not learn who writes to whom through the mailbox.
+//!   router does not learn who writes to whom through the mailbox. Each blob keeps the slot it
+//!   came through (0.6.0): mail through a silent slot is kept, with the same answer, but neither
+//!   announced nor collectable until a registration clears that slot's bit.
 //! - `GET /v1/mailbox`, `DELETE /v1/mailbox/{id}`: signed by the owner.
 //! - `GET /v1/turn-credentials`, `DELETE /v1/device`: signed.
 //! - `PUT /v1/device/push`, `DELETE /v1/device/push`: signed; where the device can be woken, kept
@@ -239,9 +243,16 @@ async fn register(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: Bytes) 
         authenticate(&hub, "POST", "/v1/device/register", Signature::from_headers(&headers), &body, Some(key)).await?;
     // The main list always rings: its bit is never kept.
     let silent_slots = registration.silent_slots & !1;
-    hub.db.register(&device, &key, &hash, silent_slots).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let before = hub.db.register(&device, &key, &hash, silent_slots).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if let Some(eight) = eight {
         hub.db.set_capabilities(&device, &eight).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+    // Sessions opened again (2026-10-01): the mail withheld for them is collectable now, and a
+    // connected phone hears of it as of any mail. A notice missed here costs nothing: the app
+    // collects whenever it connects.
+    let opened = before & !silent_slots;
+    if opened != 0 && matches!(hub.db.mail_through(&device, opened).await, Ok(true)) {
+        notify(&hub, &device, json!({ "kind": "mail" })).await;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -421,17 +432,19 @@ async fn deposit(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: H
         Ok(route) => route,
         Err(status) => return status,
     };
-    let slot = route.slot;
     if let Err(status) = hub.limit_recipient(&to) {
         return status;
     }
     if body.len() > MAX_BLOB {
         return StatusCode::PAYLOAD_TOO_LARGE;
     }
-    match hub.db.deposit(&to, slot, &body, MAILBOX_TTL).await {
+    match hub.db.deposit(&to, route.slot, &body, MAILBOX_TTL).await {
         Ok(_) => {
-            if !notify(&hub, &to, json!({ "kind": "mail" })).await {
-                wake(&hub, &to, slot);
+            // Mail through a silent slot (2026-10-01) is kept but withheld: the phone hears nothing
+            // of it, open or closed, and the push path is taken as for a phone that is not
+            // connected (it sends nothing for a silent slot). The sender's answer is the same.
+            if route.silent || !notify(&hub, &to, json!({ "kind": "mail" })).await {
+                wake(&hub, &to, route.slot);
             }
             StatusCode::CREATED
         }
