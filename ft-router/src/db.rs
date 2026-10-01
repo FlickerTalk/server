@@ -18,6 +18,14 @@ pub struct Db {
     pool: PgPool,
 }
 
+/// Where a capability leads: one of the device's eight slots, and whether the device has said
+/// that slot is silent, a session the user has left (2026-10-01).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Route {
+    pub slot: u8,
+    pub silent: bool,
+}
+
 impl Db {
     pub async fn connect(url: &str) -> Result<Self> {
         let pool = PgPoolOptions::new().max_connections(10).connect(url).await.context("cannot reach PostgreSQL")?;
@@ -63,18 +71,29 @@ impl Db {
     /// Which of the device's capabilities `capability` is, if any (§34): 0 is its own, 1–7 the
     /// others it registered (app#9).
     pub async fn capability_slot(&self, device_id: &str, capability: &[u8; 32]) -> Result<Option<u8>> {
+        Ok(self.route(device_id, capability).await?.map(|route| route.slot))
+    }
+
+    /// Which slot `capability` opens, and whether that slot is silent (2026-10-01). The same
+    /// queries either way: a silent slot costs no more time to find than any other.
+    pub async fn route(&self, device_id: &str, capability: &[u8; 32]) -> Result<Option<Route>> {
         let hash = blake3::hash(capability);
-        let row = sqlx::query("SELECT capability_hash FROM devices WHERE device_id = $1").bind(device_id).fetch_optional(&self.pool).await?;
+        let row = sqlx::query("SELECT capability_hash, silent_slots FROM devices WHERE device_id = $1")
+            .bind(device_id)
+            .fetch_optional(&self.pool)
+            .await?;
         let Some(row) = row else { return Ok(None) };
+        let silent_slots = row.get::<i16, _>("silent_slots") as u8;
+        let route = |slot: u8| Route { slot, silent: crate::push::silent(silent_slots, slot) };
         if row.get::<Vec<u8>, _>("capability_hash") == hash.as_bytes() {
-            return Ok(Some(0));
+            return Ok(Some(route(0)));
         }
         let slot = sqlx::query("SELECT slot FROM capabilities WHERE device_id = $1 AND capability_hash = $2")
             .bind(device_id)
             .bind(hash.as_bytes().as_slice())
             .fetch_optional(&self.pool)
             .await?;
-        Ok(slot.map(|row| row.get::<i16, _>("slot") as u8))
+        Ok(slot.map(|row| route(row.get::<i16, _>("slot") as u8)))
     }
 
     /// Replaces the device's eight capabilities (app#9); the first is also its own.
@@ -332,6 +351,25 @@ mod tests {
         assert_eq!(db.push_for("ft_a", 2).await.unwrap(), Some(("fcm".to_owned(), b"sealed".to_vec())));
         assert_eq!(db.push_for("ft_a", 0).await.unwrap(), Some(("fcm".to_owned(), b"sealed".to_vec())), "the main list always");
         assert!(db.push_for("ft_unknown", 0).await.unwrap().is_none());
+    }
+
+    // A capability leads to its slot, and says whether that slot is silent (2026-10-01): the main
+    // list never is, whatever the mask.
+    #[tokio::test]
+    async fn a_route_says_whether_its_slot_is_silent() {
+        let db = db().await;
+        db.register("ft_a", &KEY, &capability_hash(), 0b1000_1001).await.expect("registers");
+        let mut hashes = [[0u8; 32]; 8];
+        for (slot, hash) in hashes.iter_mut().enumerate() {
+            *hash = *blake3::hash(&[slot as u8 + 10; 32]).as_bytes();
+        }
+        db.set_capabilities("ft_a", &hashes).await.expect("eight");
+        assert_eq!(db.route("ft_a", &CAPABILITY).await.unwrap(), Some(Route { slot: 0, silent: false }), "the main list");
+        assert_eq!(db.route("ft_a", &[13; 32]).await.unwrap(), Some(Route { slot: 3, silent: true }));
+        assert_eq!(db.route("ft_a", &[14; 32]).await.unwrap(), Some(Route { slot: 4, silent: false }));
+        assert_eq!(db.route("ft_a", &[17; 32]).await.unwrap(), Some(Route { slot: 7, silent: true }));
+        assert_eq!(db.route("ft_a", &[99; 32]).await.unwrap(), None);
+        assert_eq!(db.route("ft_unknown", &CAPABILITY).await.unwrap(), None);
     }
 
     // The column comes with a migration on a database that already has devices: they keep working

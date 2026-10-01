@@ -953,13 +953,13 @@ async fn a_silent_slot_gets_no_push_and_the_sender_cannot_tell() {
     assert_eq!(android.rung(), ["dave-fcm-token"]);
     assert_eq!(iphones.0.woken(), [iphone_target(0xe0), iphone_target(0xe0), iphone_target(0xe0)], "Erin's wakes and call");
 
-    // What came for the silent slot is still there: the mail in the mailbox, the signals waiting.
+    // What came for the silent slot: the mail is in the mailbox; the signals never reach the phone
+    // (2026-10-01, the router makes a left session unreachable).
     let listed: Value = bob.request(&router, "GET", "/v1/mailbox", vec![]).await.json().await.unwrap();
     assert_eq!(listed.as_array().unwrap().len(), 1);
     let mut socket = carol.connect(&router).await;
     assert_eq!(next_json(&mut socket).await["kind"], "welcome");
-    assert_eq!(next_signal(&mut socket).await, b"offer");
-    assert_eq!(next_signal(&mut socket).await, b"call offer");
+    assert!(nothing_more(&mut socket).await, "no signal waited for the silent slot");
 }
 
 // Only the slots the phone named are silent: a spare slot without its bit still wakes and rings,
@@ -1220,4 +1220,111 @@ async fn a_silent_slot_keeps_its_own_ring_pace_and_holds_back_no_other() {
     assert!(soon(|| waker.slots() == [3]).await);
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(waker.rung_slots(), [0, 5]);
+}
+
+// ---- A left session is unreachable (2026-10-01) ----
+//
+// The owner's decision: a session the user has left looks the same from outside whether the app is
+// open or closed, and the router enforces it. A signal through a silent slot never reaches the
+// device, connected or not: it is not forwarded, not held for its next connection, and nothing is
+// pushed. The sender gets the answer of a phone that is not connected, so it cannot tell a left
+// session from a phone that is off.
+
+// The phone is connected, yet a signal or a call through its silent slot does not reach the
+// socket, and the sender's answer is, header by header, that of a phone that is not connected.
+#[tokio::test]
+async fn a_signal_through_a_silent_slot_never_reaches_a_connected_device() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_with(waker.clone())).await;
+    // Bob left the session in slot 3 and has the app open; Dave left nothing and is not connected.
+    let (bob, dave) = (Device::new(2), Device::new(4));
+    bob.register_silent(&router, json!(0b0000_1000)).await;
+    dave.register_silent(&router, json!(0)).await;
+    bob.set_push(&router, "bob-token").await;
+    dave.set_push(&router, "dave-token").await;
+    let mut socket = bob.connect(&router).await;
+    assert_eq!(next_json(&mut socket).await["kind"], "welcome");
+
+    let to_bob = seen(signal(&router, &bob, slot_capability(&bob, 3), b"offer".to_vec()).await).await;
+    let to_dave = seen(signal(&router, &dave, slot_capability(&dave, 3), b"offer".to_vec()).await).await;
+    assert_eq!(to_bob, to_dave, "a signal: the answer of a phone that is not connected");
+    assert_eq!(to_bob.0, 404);
+    assert_eq!(to_bob.1.get("ft-retained").map(String::as_str), Some("1"));
+
+    let call_bob = seen(call(&router, &bob, slot_capability(&bob, 3), b"call offer".to_vec()).await).await;
+    let call_dave = seen(call(&router, &dave, slot_capability(&dave, 3), b"call offer".to_vec()).await).await;
+    assert_eq!(call_bob, call_dave, "a call: the same");
+    assert_eq!(call_bob, to_bob);
+
+    assert!(nothing_more(&mut socket).await, "nothing reached Bob's socket");
+    assert!(soon(|| waker.woken() == ["dave-token"] && waker.rung() == ["dave-token"]).await);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!((waker.woken(), waker.rung()), (vec!["dave-token".to_owned()], vec!["dave-token".to_owned()]), "nothing pushed to Bob");
+}
+
+// What was sent through a silent slot is gone for good: not handed over when the phone connects,
+// nor once it comes back to the session, even within the minute a signal could have waited. A
+// sender that still wants through sends again (the app retries on its own).
+#[tokio::test]
+async fn nothing_sent_through_a_silent_slot_is_handed_over_later() {
+    let router = router().await;
+    let bob = Device::new(2);
+    bob.register_silent(&router, json!(0b0000_1000)).await;
+
+    assert_eq!(signal(&router, &bob, slot_capability(&bob, 3), b"offer".to_vec()).await.status(), 404);
+    assert_eq!(call(&router, &bob, slot_capability(&bob, 3), b"call offer".to_vec()).await.status(), 404);
+    let mut socket = bob.connect(&router).await;
+    assert_eq!(next_json(&mut socket).await["kind"], "welcome");
+    assert!(nothing_more(&mut socket).await, "not handed over when it connects");
+    socket.close(None).await.expect("closes");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(signal(&router, &bob, slot_capability(&bob, 3), b"another offer".to_vec()).await.status(), 404);
+    bob.register_silent(&router, json!(0)).await;
+    let mut socket = bob.connect(&router).await;
+    assert_eq!(next_json(&mut socket).await["kind"], "welcome");
+    assert!(nothing_more(&mut socket).await, "nor once the slot is no longer silent");
+
+    // Back in the session, what is sent now arrives.
+    assert_eq!(signal(&router, &bob, slot_capability(&bob, 3), b"new offer".to_vec()).await.status(), 202);
+    assert_eq!(next_signal(&mut socket).await, b"new offer");
+}
+
+// Only the silent slot is cut off: the main list and the other slots of the same phone get their
+// signals as ever, connected or not.
+#[tokio::test]
+async fn the_other_slots_of_a_device_still_get_their_signals() {
+    let router = router().await;
+    let bob = Device::new(2);
+    bob.register_silent(&router, json!(0b0000_1000)).await;
+    let mut socket = bob.connect(&router).await;
+    assert_eq!(next_json(&mut socket).await["kind"], "welcome");
+
+    assert_eq!(signal(&router, &bob, slot_capability(&bob, 5), b"to five".to_vec()).await.status(), 202);
+    assert_eq!(next_signal(&mut socket).await, b"to five");
+    assert_eq!(call(&router, &bob, bob.capability(), b"to the main list".to_vec()).await.status(), 202);
+    assert_eq!(next_signal(&mut socket).await, b"to the main list");
+    socket.close(None).await.expect("closes");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(signal(&router, &bob, slot_capability(&bob, 3), b"dropped".to_vec()).await.status(), 404);
+    assert_eq!(signal(&router, &bob, slot_capability(&bob, 5), b"kept".to_vec()).await.status(), 404);
+    let mut socket = bob.connect(&router).await;
+    assert_eq!(next_json(&mut socket).await["kind"], "welcome");
+    assert_eq!(next_signal(&mut socket).await, b"kept");
+    assert!(nothing_more(&mut socket).await);
+}
+
+// An app that sends no mask sees no change: every slot reaches it.
+#[tokio::test]
+async fn without_silent_slots_every_slot_gets_its_signals() {
+    let router = router().await;
+    let bob = Device::new(2);
+    bob.register_eight(&router).await;
+    let mut socket = bob.connect(&router).await;
+    assert_eq!(next_json(&mut socket).await["kind"], "welcome");
+    for slot in 0..8u8 {
+        assert_eq!(signal(&router, &bob, slot_capability(&bob, slot.into()), vec![slot]).await.status(), 202);
+        assert_eq!(next_signal(&mut socket).await, [slot]);
+    }
 }
