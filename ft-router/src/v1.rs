@@ -1,7 +1,9 @@
 //! Router API v1 (Plan §7, §10, §13–19, §34, §106 M2).
 //!
 //! - `POST /v1/device/register`: signed with the key being registered; stores that key and the
-//!   hash of the route capability. The app registers on every start.
+//!   hash of the route capability. The app registers on every start. Since 0.5.0 it may carry
+//!   `silent_slots` (0–255, bit i = slot i): no push goes out for those slots, sessions the user
+//!   has left; slot 0, the main list, always gets them. Each registration replaces the mask.
 //! - `GET /v1/connect`: signed WebSocket. The router sends a welcome (STUN and a temporary TURN
 //!   user), the signals addressed to the device and a notice when mail arrives.
 //! - `POST /v1/signal/{to}`: needs the recipient's capability. `202` when the recipient is
@@ -289,7 +291,10 @@ fn wake(hub: &Arc<Hub>, device: &str, slot: u8) {
     wake_as(hub, device, slot, false);
 }
 
-/// Wakes the device, or rings it when the signal is a call.
+/// Wakes the device, or rings it when the signal is a call. Nothing goes out for a slot the device
+/// said is silent (2026-10-01), a session the user has left; that is decided in the background,
+/// after the pace is taken, so the sender's answer, its timing and the pace are the same whether
+/// the push goes out or not.
 fn wake_as(hub: &Arc<Hub>, device: &str, slot: u8, call: bool) {
     let Some(push) = hub.push.clone() else { return };
     // Each capability has its own pace: a quiet one never holds back the device's own (app#9).
@@ -298,7 +303,7 @@ fn wake_as(hub: &Arc<Hub>, device: &str, slot: u8, call: bool) {
     }
     let (hub, device) = (hub.clone(), device.to_owned());
     tokio::spawn(async move {
-        let Ok(Some((provider, sealed))) = hub.db.push_of(&device).await else { return };
+        let Ok(Some((provider, sealed))) = hub.db.push_for(&device, slot).await else { return };
         let Some(waker) = push.waker(&provider) else { return };
         let Ok(token) = push.vault.open(&sealed) else { return };
         let woke = if call { waker.ring(&token, slot).await } else { waker.wake(&token, slot).await };
