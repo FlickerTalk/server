@@ -11,7 +11,7 @@ so it cannot read them. [flickertalk.com](https://flickertalk.com)
 | Device ID, public key, hash of the routing code | Authenticate a phone's signed requests | Until the user erases the phone |
 | Push token, encrypted with a key kept outside the database | Wake a phone through FCM or APNs | Same, or until the provider says it expired |
 | Which of the phone's eight routing codes are silent: eight bits, nothing else | Keep a session the user has left unreachable | Replaced at every registration; until the user erases the phone |
-| Undelivered messages, end-to-end encrypted, without sender, each with the number (0–7) of the routing code it came through | Deliver them later; hold back those for a session the user has left | Until picked up, at most 7 days |
+| Undelivered messages, end-to-end encrypted, without sender, each with the number (0–7) of the routing code it came through | Deliver them later; hold back those for a session the user has left; give each routing code its own quota | Until picked up, at most 7 days |
 | Connection offers and answers for a phone that is not connected, end-to-end encrypted | Hand them over as soon as it connects | In memory only, never on disk: until it connects, at most 55 seconds |
 
 A signal for a phone that is not connected is answered `404` with `ft-retained: 1`: the router
@@ -33,8 +33,14 @@ open or not: nothing is pushed for it; a signal or a call through it is neither 
 and its sender gets the answer of a phone that is not connected (`404` with `ft-retained: 1`); mail
 through it is kept with the usual answer, but the phone is not told of it and does not collect it
 until a registration clears that bit, when a connected phone gets the usual mail notice. Withheld
-mail expires after 7 days like any other. The phone sets the bits of its unused codes at random, so
-the bits do not tell how many sessions it has.
+mail expires after 7 days like any other. A signal held for a phone remembers its code too, and if
+that code has become silent by the time the phone connects, it is dropped instead of handed over.
+The phone sets the bits of its unused codes at random, so the bits do not tell how many sessions it
+has.
+
+Each routing code has its own mailbox quota: up to 1000 messages waiting through the main list and
+200 through each other code, so a session whose mail is withheld cannot fill the main list's. A full
+code answers `507` for that code only, exactly as a full mailbox does, silent or not.
 
 No conversations, no contacts, no history, no access logs, no IP logs. There are no `/messages`,
 `/conversations`, `/users` or `/profiles` endpoints, and there never will be.
