@@ -10,6 +10,7 @@ so it cannot read them. [flickertalk.com](https://flickertalk.com)
 | --- | --- | --- |
 | Device ID, public key, hash of the routing code | Authenticate a phone's signed requests | Until the user erases the phone |
 | Push token, encrypted with a key kept outside the database | Wake a phone through FCM or APNs | Same, or until the provider says it expired |
+| Which of the phone's eight routing codes are silent: eight bits, nothing else | Send no push for a session the user has left | Replaced at every registration; until the user erases the phone |
 | Undelivered messages, end-to-end encrypted, without sender | Deliver them later | Until picked up, at most 7 days |
 | Connection offers and answers for a phone that is not connected, end-to-end encrypted | Hand them over as soon as it connects | In memory only, never on disk: until it connects, at most 55 seconds |
 
@@ -17,6 +18,12 @@ A signal for a phone that is not connected is answered `404` with `ft-retained: 
 wakes the phone and holds the signal in memory (eight per phone and 32 MiB in all, the oldest
 dropped first) to hand it over, in order and once, when the phone connects. Because it lives in
 memory, the router runs as a single replica.
+
+A phone registers eight routing codes, most of them unused, and may say which are silent
+(`silent_slots`, bit *i* for code *i*; the first, the main list, is never silent). Nothing is
+pushed for a silent code: mail for it is still kept and a signal still waits, and the sender gets
+the same answer as when a push goes out. The phone sets the bits of its unused codes at random, so
+the bits do not tell how many sessions it has.
 
 No conversations, no contacts, no history, no access logs, no IP logs. There are no `/messages`,
 `/conversations`, `/users` or `/profiles` endpoints, and there never will be.
