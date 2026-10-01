@@ -229,7 +229,7 @@ async fn register(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: Bytes) 
     };
     let device =
         authenticate(&hub, "POST", "/v1/device/register", Signature::from_headers(&headers), &body, Some(key)).await?;
-    hub.db.register(&device, &key, &hash).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    hub.db.register(&device, &key, &hash, 0).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if let Some(eight) = eight {
         hub.db.set_capabilities(&device, &eight).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     }
