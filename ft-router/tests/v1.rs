@@ -953,10 +953,10 @@ async fn a_silent_slot_gets_no_push_and_the_sender_cannot_tell() {
     assert_eq!(android.rung(), ["dave-fcm-token"]);
     assert_eq!(iphones.0.woken(), [iphone_target(0xe0), iphone_target(0xe0), iphone_target(0xe0)], "Erin's wakes and call");
 
-    // What came for the silent slot: the mail is in the mailbox; the signals never reach the phone
-    // (2026-10-01, the router makes a left session unreachable).
+    // What came for the silent slot (2026-10-01, the router makes a left session unreachable): the
+    // mail is kept but withheld from the phone, and the signals never reach it.
     let listed: Value = bob.request(&router, "GET", "/v1/mailbox", vec![]).await.json().await.unwrap();
-    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert!(listed.as_array().unwrap().is_empty(), "withheld while the slot is silent");
     let mut socket = carol.connect(&router).await;
     assert_eq!(next_json(&mut socket).await["kind"], "welcome");
     assert!(nothing_more(&mut socket).await, "no signal waited for the silent slot");

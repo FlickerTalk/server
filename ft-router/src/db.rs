@@ -43,20 +43,24 @@ impl Db {
     }
 
     /// Adds the device or refreshes its capability (the app registers on every start). The silent
-    /// slots (2026-10-01) are replaced too: the mask stored is always the latest one sent.
-    pub async fn register(&self, device_id: &str, signing_key: &[u8; 32], capability_hash: &[u8; 32], silent_slots: u8) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO devices (device_id, signing_key, capability_hash, silent_slots) VALUES ($1, $2, $3, $4)
+    /// slots (2026-10-01) are replaced too: the mask stored is always the latest one sent. Returns
+    /// the mask it replaced, 0 for a new device.
+    pub async fn register(&self, device_id: &str, signing_key: &[u8; 32], capability_hash: &[u8; 32], silent_slots: u8) -> Result<u8> {
+        // The subquery sees the row as it was before this statement.
+        let row = sqlx::query(
+            "WITH before AS (SELECT silent_slots FROM devices WHERE device_id = $1)
+             INSERT INTO devices (device_id, signing_key, capability_hash, silent_slots) VALUES ($1, $2, $3, $4)
              ON CONFLICT (device_id) DO UPDATE
-             SET capability_hash = excluded.capability_hash, silent_slots = excluded.silent_slots, updated_at = now()",
+             SET capability_hash = excluded.capability_hash, silent_slots = excluded.silent_slots, updated_at = now()
+             RETURNING COALESCE((SELECT silent_slots FROM before), 0)::smallint AS before",
         )
         .bind(device_id)
         .bind(signing_key.as_slice())
         .bind(capability_hash.as_slice())
         .bind(i16::from(silent_slots))
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
-        Ok(())
+        Ok(row.get::<i16, _>("before") as u8)
     }
 
     pub async fn signing_key(&self, device_id: &str) -> Result<Option<[u8; 32]>> {
@@ -168,7 +172,9 @@ impl Db {
         Ok(row.map(|row| row.get::<i16, _>("silent_slots") as u8))
     }
 
-    pub async fn deposit(&self, device_id: &str, blob: &[u8], ttl: Duration) -> Result<Uuid> {
+    /// Keeps a blob that came through `slot` (0–7), withheld from the device while that slot is
+    /// silent (2026-10-01). The quota counts every blob waiting, withheld or not.
+    pub async fn deposit(&self, device_id: &str, slot: u8, blob: &[u8], ttl: Duration) -> Result<Uuid> {
         if blob.len() > MAX_BLOB {
             bail!("the blob is too large");
         }
@@ -181,23 +187,45 @@ impl Db {
             bail!("the mailbox is full");
         }
         let id = Uuid::now_v7();
-        sqlx::query("INSERT INTO mailbox (id, device_id, blob, expires_at) VALUES ($1, $2, $3, now() + make_interval(secs => $4))")
-            .bind(id)
-            .bind(device_id)
-            .bind(blob)
-            .bind(ttl.as_secs_f64())
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "INSERT INTO mailbox (id, device_id, slot, blob, expires_at) VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5))",
+        )
+        .bind(id)
+        .bind(device_id)
+        .bind(i16::from(slot))
+        .bind(blob)
+        .bind(ttl.as_secs_f64())
+        .execute(&self.pool)
+        .await?;
         Ok(id)
     }
 
-    /// The device's unexpired blobs, oldest first.
+    /// The device's unexpired blobs, oldest first, but those that came through a slot that is
+    /// silent now (2026-10-01): they wait until the user opens that session again. The main list
+    /// (slot 0) is never withheld.
     pub async fn collect(&self, device_id: &str) -> Result<Vec<(Uuid, Vec<u8>)>> {
-        let rows = sqlx::query("SELECT id, blob FROM mailbox WHERE device_id = $1 AND expires_at > now() ORDER BY id")
+        let rows = sqlx::query(
+            "SELECT id, blob FROM mailbox
+             WHERE device_id = $1 AND expires_at > now()
+               AND (slot = 0 OR (COALESCE((SELECT silent_slots FROM devices WHERE device_id = $1), 0)::int >> slot) & 1 = 0)
+             ORDER BY id",
+        )
             .bind(device_id)
             .fetch_all(&self.pool)
             .await?;
         Ok(rows.iter().map(|row| (row.get("id"), row.get("blob"))).collect())
+    }
+
+    /// Whether unexpired mail waits for the device through any of `slots` (bit i = slot i).
+    pub async fn mail_through(&self, device_id: &str, slots: u8) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT EXISTS (SELECT 1 FROM mailbox WHERE device_id = $1 AND expires_at > now() AND ($2::int >> slot) & 1 = 1) AS waiting",
+        )
+        .bind(device_id)
+        .bind(i32::from(slots))
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get("waiting"))
     }
 
     /// Deletes a blob its owner has stored (ACK, §19). False if it is not theirs or not there.
@@ -280,9 +308,9 @@ mod tests {
     #[tokio::test]
     async fn the_mailbox_hands_blobs_over_in_order_until_acknowledged() {
         let db = db().await;
-        let first = db.deposit("ft_a", b"one", Duration::from_secs(60)).await.expect("deposits");
-        db.deposit("ft_a", b"two", Duration::from_secs(60)).await.expect("deposits");
-        db.deposit("ft_b", b"not yours", Duration::from_secs(60)).await.expect("deposits");
+        let first = db.deposit("ft_a", 0, b"one", Duration::from_secs(60)).await.expect("deposits");
+        db.deposit("ft_a", 0, b"two", Duration::from_secs(60)).await.expect("deposits");
+        db.deposit("ft_b", 0, b"not yours", Duration::from_secs(60)).await.expect("deposits");
 
         let blobs = db.collect("ft_a").await.expect("collects");
         assert_eq!(blobs.iter().map(|(_, blob)| blob.as_slice()).collect::<Vec<_>>(), [b"one".as_slice(), b"two"]);
@@ -294,7 +322,7 @@ mod tests {
     #[tokio::test]
     async fn nobody_can_acknowledge_someone_elses_mail() {
         let db = db().await;
-        let id = db.deposit("ft_a", b"one", Duration::from_secs(60)).await.expect("deposits");
+        let id = db.deposit("ft_a", 0, b"one", Duration::from_secs(60)).await.expect("deposits");
         assert!(!db.acknowledge("ft_b", id).await.expect("refuses"));
         assert_eq!(db.collect("ft_a").await.unwrap().len(), 1);
     }
@@ -303,7 +331,7 @@ mod tests {
     #[tokio::test]
     async fn expired_mail_is_neither_handed_over_nor_kept() {
         let db = db().await;
-        db.deposit("ft_a", b"old", Duration::ZERO).await.expect("deposits");
+        db.deposit("ft_a", 0, b"old", Duration::ZERO).await.expect("deposits");
         assert!(db.collect("ft_a").await.unwrap().is_empty());
         assert_eq!(db.purge_expired().await.expect("purges"), 1);
     }
@@ -311,11 +339,11 @@ mod tests {
     #[tokio::test]
     async fn a_mailbox_has_a_quota_and_blobs_a_maximum_size() {
         let db = db().await;
-        assert!(db.deposit("ft_a", &vec![0; MAX_BLOB + 1], Duration::from_secs(60)).await.is_err());
+        assert!(db.deposit("ft_a", 0, &vec![0; MAX_BLOB + 1], Duration::from_secs(60)).await.is_err());
         for _ in 0..MAX_BLOBS_PER_DEVICE {
-            db.deposit("ft_a", b"x", Duration::from_secs(60)).await.expect("within the quota");
+            db.deposit("ft_a", 0, b"x", Duration::from_secs(60)).await.expect("within the quota");
         }
-        assert!(db.deposit("ft_a", b"x", Duration::from_secs(60)).await.is_err());
+        assert!(db.deposit("ft_a", 0, b"x", Duration::from_secs(60)).await.is_err());
     }
 
     // §73 / §75: the mailbox must never reach the WAL archive or a backup.
@@ -399,9 +427,109 @@ mod tests {
     async fn forgetting_a_device_removes_its_registration_and_mail() {
         let db = db().await;
         db.register("ft_a", &KEY, &capability_hash(), 0).await.expect("registers");
-        db.deposit("ft_a", b"one", Duration::from_secs(60)).await.expect("deposits");
+        db.deposit("ft_a", 0, b"one", Duration::from_secs(60)).await.expect("deposits");
         db.forget("ft_a").await.expect("forgets");
         assert!(db.signing_key("ft_a").await.unwrap().is_none());
         assert!(db.collect("ft_a").await.unwrap().is_empty());
+    }
+
+    // ---- A left session is unreachable (2026-10-01) ----
+
+    /// The blobs `device` would collect now.
+    async fn collectable(db: &Db, device: &str) -> Vec<Vec<u8>> {
+        db.collect(device).await.expect("collects").into_iter().map(|(_, blob)| blob).collect()
+    }
+
+    // Mail through a silent slot is kept, but the device does not get it while the slot is silent;
+    // coming back to the session hands it over, in order with the rest, and leaving it again
+    // withholds again what is still there.
+    #[tokio::test]
+    async fn mail_through_a_silent_slot_is_kept_but_withheld() {
+        let db = db().await;
+        db.register("ft_a", &KEY, &capability_hash(), 0b0000_1000).await.expect("registers");
+        db.deposit("ft_a", 0, b"main", Duration::from_secs(60)).await.expect("deposits");
+        db.deposit("ft_a", 3, b"left", Duration::from_secs(60)).await.expect("deposits");
+        db.deposit("ft_a", 5, b"five", Duration::from_secs(60)).await.expect("deposits");
+        assert_eq!(collectable(&db, "ft_a").await, [b"main".to_vec(), b"five".to_vec()]);
+
+        db.register("ft_a", &KEY, &capability_hash(), 0).await.expect("comes back");
+        assert_eq!(collectable(&db, "ft_a").await, [b"main".to_vec(), b"left".to_vec(), b"five".to_vec()]);
+
+        db.register("ft_a", &KEY, &capability_hash(), 0b0010_1000).await.expect("leaves again");
+        assert_eq!(collectable(&db, "ft_a").await, [b"main".to_vec()], "withheld again, slot 5 too");
+    }
+
+    // The TTL is the same for withheld mail: once expired it is neither handed over nor kept.
+    #[tokio::test]
+    async fn withheld_mail_expires_like_any_other() {
+        let db = db().await;
+        db.register("ft_a", &KEY, &capability_hash(), 0b0000_1000).await.expect("registers");
+        db.deposit("ft_a", 3, b"old", Duration::ZERO).await.expect("deposits");
+        db.deposit("ft_a", 3, b"recent", Duration::from_secs(60)).await.expect("deposits");
+        assert_eq!(db.purge_expired().await.expect("purges"), 1);
+        db.register("ft_a", &KEY, &capability_hash(), 0).await.expect("comes back");
+        assert_eq!(collectable(&db, "ft_a").await, [b"recent".to_vec()]);
+    }
+
+    // A blob remembers the slot it came through, one of the eight and nothing else.
+    #[tokio::test]
+    async fn a_blob_comes_through_one_of_eight_slots() {
+        let db = db().await;
+        for slot in 0..8 {
+            db.deposit("ft_a", slot, b"x", Duration::from_secs(60)).await.expect("one of the eight");
+        }
+        assert!(db.deposit("ft_a", 8, b"x", Duration::from_secs(60)).await.is_err());
+        assert_eq!(db.collect("ft_a").await.unwrap().len(), 8);
+    }
+
+    // A registration tells which mask it replaced (0 for a new device), so the router knows which
+    // slots it has just let through.
+    #[tokio::test]
+    async fn a_registration_tells_the_mask_it_replaced() {
+        let db = db().await;
+        assert_eq!(db.register("ft_a", &KEY, &capability_hash(), 0b0000_0110).await.unwrap(), 0, "new");
+        assert_eq!(db.register("ft_a", &KEY, &capability_hash(), 0b0000_0010).await.unwrap(), 0b0000_0110);
+        assert_eq!(db.register("ft_a", &KEY, &capability_hash(), 0).await.unwrap(), 0b0000_0010);
+    }
+
+    // Whether any unexpired mail came through the given slots: what decides the notice when a
+    // session is opened again.
+    #[tokio::test]
+    async fn mail_waiting_through_some_slots() {
+        let db = db().await;
+        db.deposit("ft_a", 3, b"x", Duration::from_secs(60)).await.expect("deposits");
+        db.deposit("ft_a", 6, b"x", Duration::ZERO).await.expect("deposits");
+        db.deposit("ft_b", 2, b"x", Duration::from_secs(60)).await.expect("deposits");
+        assert!(db.mail_through("ft_a", 0b0000_1000).await.unwrap());
+        assert!(db.mail_through("ft_a", 0b0100_1100).await.unwrap());
+        assert!(!db.mail_through("ft_a", 0b0000_0100).await.unwrap(), "slot 2 is another device's");
+        assert!(!db.mail_through("ft_a", 0b0100_0000).await.unwrap(), "expired");
+        assert!(!db.mail_through("ft_a", 0).await.unwrap());
+    }
+
+    // On a database as router 0.5.1 left it, the mailbox gets its slot column: what was waiting
+    // came through the main list (0) and is handed over whatever the mask, and the table stays
+    // UNLOGGED.
+    #[tokio::test]
+    async fn the_mailbox_slot_migration_applies_to_a_database_from_0_5_1() {
+        let url = std::env::var("FT_TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:test@127.0.0.1:55432/ft_router_test".to_owned());
+        let pool = isolated_pool(&url).await.expect("a fresh schema");
+        sqlx::migrate!("./migrations").run_to(4, &pool).await.expect("migrates up to 0004");
+        sqlx::query("INSERT INTO devices (device_id, signing_key, capability_hash, silent_slots) VALUES ('ft_old', $1, $2, 254)")
+            .bind(KEY.as_slice())
+            .bind(capability_hash().as_slice())
+            .execute(&pool)
+            .await
+            .expect("an existing device that left every session");
+        sqlx::query("INSERT INTO mailbox (id, device_id, blob, expires_at) VALUES ($1, 'ft_old', 'waiting', now() + interval '1 hour')")
+            .bind(Uuid::now_v7())
+            .execute(&pool)
+            .await
+            .expect("mail waiting");
+
+        let db = Db::migrated(pool).await.expect("migrates the rest");
+        assert_eq!(collectable(&db, "ft_old").await, [b"waiting".to_vec()]);
+        assert_eq!(db.persistence("mailbox").await.unwrap(), "u");
     }
 }

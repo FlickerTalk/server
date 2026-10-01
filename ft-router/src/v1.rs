@@ -428,7 +428,7 @@ async fn deposit(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: H
     if body.len() > MAX_BLOB {
         return StatusCode::PAYLOAD_TOO_LARGE;
     }
-    match hub.db.deposit(&to, &body, MAILBOX_TTL).await {
+    match hub.db.deposit(&to, slot, &body, MAILBOX_TTL).await {
         Ok(_) => {
             if !notify(&hub, &to, json!({ "kind": "mail" })).await {
                 wake(&hub, &to, slot);
