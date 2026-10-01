@@ -1,6 +1,6 @@
 [package]
 name = "ft-router"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 description = "FlickerTalk push router and encrypted mailbox"
 license = "AGPL-3.0-only"
