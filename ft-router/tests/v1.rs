@@ -10,7 +10,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use ft_router::auth::{device_id, SignedRequest};
 use ft_router::db::Db;
 use ft_router::turn::TurnIssuer;
-use ft_router::push::{apns_target, PushVault, Wake, WakeLimiter, Waker, APNS, FCM};
+use ft_router::push::{apns_target, PushVault, RingLimiter, Wake, WakeLimiter, Waker, APNS, FCM, RING_EVERY, RING_FOR};
 use ft_router::limits::Limits;
 use ft_router::{app, Config, Push};
 use futures_util::StreamExt;
@@ -106,9 +106,20 @@ impl FakeWaker {
     }
 }
 
+/// FCM, fake, with the paces of production.
 fn push_with(waker: Arc<FakeWaker>) -> Option<Arc<Push>> {
+    push_ringing(waker, RING_EVERY, RING_FOR)
+}
+
+/// FCM, fake, waking at the pace of production and ringing at the pace given.
+fn push_ringing(waker: Arc<FakeWaker>, ring_every: Duration, ring_for: Duration) -> Option<Arc<Push>> {
     let wakers = [(FCM.to_owned(), waker as Arc<dyn Waker>)].into_iter().collect();
-    Some(Arc::new(Push { vault: PushVault::new(&[9; 32]), wakers, limiter: WakeLimiter::new(Duration::from_secs(10)) }))
+    Some(Arc::new(Push {
+        vault: PushVault::new(&[9; 32]),
+        wakers,
+        limiter: WakeLimiter::new(Duration::from_secs(10)),
+        ring_limiter: RingLimiter::new(ring_every, ring_for),
+    }))
 }
 
 /// Records what it was asked to wake, and only takes what an APNs target looks like.
@@ -128,7 +139,12 @@ impl Waker for FakeApns {
 
 fn push_for_both(android: Arc<FakeWaker>, iphones: Arc<FakeApns>) -> Option<Arc<Push>> {
     let wakers = [(FCM.to_owned(), android as Arc<dyn Waker>), (APNS.to_owned(), iphones as Arc<dyn Waker>)].into_iter().collect();
-    Some(Arc::new(Push { vault: PushVault::new(&[9; 32]), wakers, limiter: WakeLimiter::new(Duration::from_secs(10)) }))
+    Some(Arc::new(Push {
+        vault: PushVault::new(&[9; 32]),
+        wakers,
+        limiter: WakeLimiter::new(Duration::from_secs(10)),
+        ring_limiter: RingLimiter::new(RING_EVERY, RING_FOR),
+    }))
 }
 
 /// Waits a little for work the router does in the background.
@@ -859,10 +875,11 @@ async fn each_registration_replaces_the_silent_slots() {
     assert_eq!(router.db.silent_slots(&bob.id()).await.unwrap(), Some(0), "absent is 0");
 }
 
-/// FCM and APNs, both fake, paced as given: `Duration::ZERO` lets every push through.
+/// FCM and APNs, both fake, waking and ringing at the pace given: `Duration::ZERO` lets every push
+/// through.
 fn push_paced(android: Arc<FakeWaker>, iphones: Arc<FakeApns>, every: Duration) -> Option<Arc<Push>> {
     let wakers = [(FCM.to_owned(), android as Arc<dyn Waker>), (APNS.to_owned(), iphones as Arc<dyn Waker>)].into_iter().collect();
-    Some(Arc::new(Push { vault: PushVault::new(&[9; 32]), wakers, limiter: WakeLimiter::new(every) }))
+    Some(Arc::new(Push { vault: PushVault::new(&[9; 32]), wakers, limiter: WakeLimiter::new(every), ring_limiter: RingLimiter::new(every, every) }))
 }
 
 fn iphone_target(seed: u8) -> String {
@@ -1021,4 +1038,186 @@ async fn a_silent_slot_keeps_its_own_pace_and_holds_back_no_other() {
     deposit(&router, &bob, slot_capability(&bob, 3), b"sealed".to_vec()).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(waker.slots(), [0, 5]);
+}
+
+// ---- Rings and wakes, each at its own pace (0.5.1) ----
+//
+// Found on real phones (2026-10-01): a message woke a closed iPhone, and the same caller's call
+// about ten seconds later sent no push at all, because a wake and a ring shared one pace. A call's
+// push is now or never: a ring is never held back by a wake, nor a wake by a ring. A ring has a
+// pace of its own, against a flood and against a caller's retry ringing the phone twice: after a
+// ring, the next one waits until the phone has connected (it took the call's signal) and the floor
+// has passed, or until the ring has run out.
+
+/// The phone wakes, connects, takes the one signal that waited for it and goes back to sleep.
+async fn take_and_sleep(router: &Router, device: &Device) {
+    let mut socket = device.connect(router).await;
+    assert_eq!(next_json(&mut socket).await["kind"], "welcome");
+    next_signal(&mut socket).await;
+    socket.close(None).await.expect("closes");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
+// What the phones showed: mail and a message's offer wake the phone, and a call right after rings
+// it all the same.
+#[tokio::test]
+async fn a_call_rings_right_after_a_wake() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_with(waker.clone())).await;
+    let bob = Device::new(2);
+    bob.register_eight(&router).await;
+    bob.set_push(&router, "bob-token").await;
+
+    deposit(&router, &bob, bob.capability(), b"sealed".to_vec()).await;
+    signal(&router, &bob, bob.capability(), b"offer".to_vec()).await;
+    assert!(soon(|| waker.woken() == ["bob-token"]).await);
+    assert_eq!(call(&router, &bob, bob.capability(), b"call offer".to_vec()).await.status(), 404);
+    assert!(soon(|| waker.rung() == ["bob-token"]).await, "the call rings within the wake's pace");
+    assert_eq!(waker.woken(), ["bob-token"], "and the wake's pace still holds for wakes");
+}
+
+// A message right after a ring still wakes the phone: it is something else to fetch, and the
+// ring took nothing of the wake's pace. Each kind then keeps its own pace.
+#[tokio::test]
+async fn a_wake_goes_out_right_after_a_ring_and_each_keeps_its_own_pace() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_with(waker.clone())).await;
+    let bob = Device::new(2);
+    bob.register_eight(&router).await;
+    bob.set_push(&router, "bob-token").await;
+
+    call(&router, &bob, bob.capability(), b"call offer".to_vec()).await;
+    assert!(soon(|| waker.rung() == ["bob-token"]).await);
+    deposit(&router, &bob, bob.capability(), b"sealed".to_vec()).await;
+    assert!(soon(|| waker.woken() == ["bob-token"]).await, "woken right after the ring");
+
+    deposit(&router, &bob, bob.capability(), b"sealed".to_vec()).await;
+    call(&router, &bob, bob.capability(), b"call offer".to_vec()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!((waker.woken().len(), waker.rung().len()), (1, 1), "neither again so soon");
+}
+
+// A caller that sends its call again while the phone has not yet answered the ring (it has not
+// connected) rings it no more: on an iPhone each VoIP push is a call for CallKit. Once the ring
+// has run out, a call rings again. The caller gets the same answer either way.
+#[tokio::test]
+async fn a_retry_of_the_same_call_rings_once() {
+    let waker = Arc::new(FakeWaker::default());
+    // No floor at all: only the ring that the phone has not taken holds the retries back.
+    let router = router_with(push_ringing(waker.clone(), Duration::ZERO, Duration::from_millis(1500))).await;
+    let bob = Device::new(2);
+    bob.register_eight(&router).await;
+    bob.set_push(&router, "bob-token").await;
+
+    let started = std::time::Instant::now();
+    let first = seen(call(&router, &bob, bob.capability(), b"call offer".to_vec()).await).await;
+    for _ in 0..4 {
+        let retry = seen(call(&router, &bob, bob.capability(), b"call offer".to_vec()).await).await;
+        assert_eq!(retry, first, "the caller cannot tell a held ring from one that went out");
+    }
+    assert!(soon(|| waker.rung() == ["bob-token"]).await);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(waker.rung().len(), 1, "rung once");
+
+    tokio::time::sleep(Duration::from_millis(1700).saturating_sub(started.elapsed())).await;
+    call(&router, &bob, bob.capability(), b"call offer".to_vec()).await;
+    assert!(soon(|| waker.rung().len() == 2).await, "the ring ran out: the next call rings");
+}
+
+// Two calls in a row: the phone took the first (it connected and got its signal), so the second
+// is a new call and rings, once the floor has passed.
+#[tokio::test]
+async fn a_second_call_rings_once_the_phone_took_the_first() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_ringing(waker.clone(), Duration::from_secs(1), Duration::from_secs(30))).await;
+    let bob = Device::new(2);
+    bob.register_eight(&router).await;
+    bob.set_push(&router, "bob-token").await;
+
+    let started = std::time::Instant::now();
+    call(&router, &bob, bob.capability(), b"first call".to_vec()).await;
+    assert!(soon(|| waker.rung().len() == 1).await);
+    take_and_sleep(&router, &bob).await;
+
+    tokio::time::sleep(Duration::from_millis(1200).saturating_sub(started.elapsed())).await;
+    assert_eq!(call(&router, &bob, bob.capability(), b"second call".to_vec()).await.status(), 404);
+    assert!(soon(|| waker.rung().len() == 2).await, "the second call rings");
+}
+
+// A flood stays bounded: without the phone connecting, a ring at most per ring; with the phone
+// connecting after each ring, still no more than one ring per floor.
+#[tokio::test]
+async fn a_flood_of_calls_rings_no_more_often_than_its_pace() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_with(waker.clone())).await;
+    let bob = Device::new(2);
+    bob.register_eight(&router).await;
+    bob.set_push(&router, "bob-token").await;
+    for _ in 0..30 {
+        assert_eq!(call(&router, &bob, bob.capability(), b"flood".to_vec()).await.status(), 404);
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(waker.rung().len(), 1, "production paces: one ring");
+
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_ringing(waker.clone(), Duration::from_secs(3), Duration::from_secs(30))).await;
+    let carol = Device::new(3);
+    carol.register_eight(&router).await;
+    carol.set_push(&router, "carol-token").await;
+    let started = std::time::Instant::now();
+    for _ in 0..5 {
+        assert_eq!(call(&router, &carol, carol.capability(), b"flood".to_vec()).await.status(), 404);
+        take_and_sleep(&router, &carol).await;
+    }
+    assert!(started.elapsed() < Duration::from_secs(3), "all within the floor");
+    assert_eq!(waker.rung().len(), 1, "the phone took every ring, and still one per floor");
+}
+
+// The main list and a spare slot ring on their own: a ring held back on one holds back no other,
+// and neither holds back a wake.
+#[tokio::test]
+async fn the_main_list_and_a_spare_slot_ring_on_their_own() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_with(waker.clone())).await;
+    let bob = Device::new(2);
+    bob.register_eight(&router).await;
+    bob.set_push(&router, "bob-token").await;
+
+    call(&router, &bob, slot_capability(&bob, 5), b"call offer".to_vec()).await;
+    assert!(soon(|| waker.rung_slots() == [5]).await);
+    call(&router, &bob, bob.capability(), b"call offer".to_vec()).await;
+    assert!(soon(|| waker.rung_slots() == [5, 0]).await, "slot 5 holds back nothing of the main list");
+    call(&router, &bob, slot_capability(&bob, 5), b"call offer".to_vec()).await;
+    call(&router, &bob, bob.capability(), b"call offer".to_vec()).await;
+    deposit(&router, &bob, slot_capability(&bob, 5), b"sealed".to_vec()).await;
+    deposit(&router, &bob, bob.capability(), b"sealed".to_vec()).await;
+    assert!(soon(|| waker.slots() == [5, 0]).await, "both wake");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(waker.rung_slots(), [5, 0], "neither rings twice");
+}
+
+// A silent slot gets no ring, yet its ring pace is taken just as when the ring goes out; it holds
+// back no other slot, and no wake.
+#[tokio::test]
+async fn a_silent_slot_keeps_its_own_ring_pace_and_holds_back_no_other() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_with(waker.clone())).await;
+    let bob = Device::new(2);
+    bob.register_silent(&router, json!(0b0000_1000)).await;
+    bob.set_push(&router, "bob-token").await;
+
+    call(&router, &bob, slot_capability(&bob, 3), b"call offer".to_vec()).await;
+    call(&router, &bob, bob.capability(), b"call offer".to_vec()).await;
+    assert!(soon(|| waker.rung_slots() == [0]).await);
+    call(&router, &bob, slot_capability(&bob, 5), b"call offer".to_vec()).await;
+    assert!(soon(|| waker.rung_slots() == [0, 5]).await);
+
+    // Back in slot 3 while its skipped ring would still be ringing: held back, as a ring that went
+    // out would be. A wake for it goes out: the ring took nothing of the wake's pace.
+    bob.register_silent(&router, json!(0)).await;
+    call(&router, &bob, slot_capability(&bob, 3), b"call offer".to_vec()).await;
+    deposit(&router, &bob, slot_capability(&bob, 3), b"sealed".to_vec()).await;
+    assert!(soon(|| waker.slots() == [3]).await);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(waker.rung_slots(), [0, 5]);
 }

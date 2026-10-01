@@ -8,7 +8,9 @@
 //! - `Apns`: Apple's push, HTTP/2 with a token signed by the team's .p8 key (2026-09-28). An
 //!   iPhone shows what arrives, so the push is a visible notification whose text is a key the
 //!   phone translates: still no sender, no content and no language on our side.
-//! - `WakeLimiter`: at most one wake-up per device every few seconds.
+//! - `WakeLimiter`: at most one wake-up per device and slot every few seconds.
+//! - `RingLimiter`: rings for calls at a pace of their own (0.5.1), so a wake never holds back a
+//!   call and a caller's retry never rings a phone twice.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -114,12 +116,71 @@ impl WakeLimiter {
     }
 }
 
+/// A ring lasts this long: FCM keeps a call push 45 s and the caller has given up by then.
+pub const RING_FOR: Duration = Duration::from_secs(45);
+/// Rings come at most this often, even for a phone that took the last one.
+pub const RING_EVERY: Duration = Duration::from_secs(10);
+
+/// The last ring of a device and slot: when, and whether the phone has connected since.
+struct Ring {
+    at: Instant,
+    taken: bool,
+}
+
+/// Paces rings for calls (0.5.1), apart from wakes: neither holds the other back, because a
+/// call's push is now or never. The router cannot tell a caller's retry from a new call, so after
+/// a ring the next one waits until the phone has connected (it took the call's signal, so the ring
+/// did its job) and `every` has passed, or until the ring has run out (`ring_for`). A retry while
+/// the phone has not answered the ring never rings it twice; a flood rings at most once per
+/// `every` even when the phone keeps connecting.
+pub struct RingLimiter {
+    every: Duration,
+    ring_for: Duration,
+    last: Mutex<HashMap<(String, u8), Ring>>,
+}
+
+impl RingLimiter {
+    pub fn new(every: Duration, ring_for: Duration) -> Self {
+        Self { every, ring_for, last: Mutex::default() }
+    }
+
+    /// Whether the device may be rung through `slot` now; if so, the time is taken.
+    pub fn allow(&self, device: &str, slot: u8) -> bool {
+        let mut last = self.last.lock().expect("limiter poisoned");
+        let now = Instant::now();
+        last.retain(|_, ring| !self.done(ring, now));
+        let key = (device.to_owned(), slot);
+        if last.contains_key(&key) {
+            return false;
+        }
+        last.insert(key, Ring { at: now, taken: false });
+        true
+    }
+
+    /// The device connected: it took what waited for it, the signals of its rings among them.
+    pub fn picked_up(&self, device: &str) {
+        let mut last = self.last.lock().expect("limiter poisoned");
+        for ((rung, _), ring) in last.iter_mut() {
+            if rung == device {
+                ring.taken = true;
+            }
+        }
+    }
+
+    /// A ring that holds nothing back any more.
+    fn done(&self, ring: &Ring, now: Instant) -> bool {
+        let since = now.duration_since(ring.at);
+        since >= self.ring_for || (ring.taken && since >= self.every)
+    }
+}
+
 /// Push, when configured: the vault for tokens, who wakes each kind of phone and how often.
 pub struct Push {
     pub vault: PushVault,
     /// By provider (`FCM`, `APNS`); a provider that is not configured is not here.
     pub wakers: HashMap<String, std::sync::Arc<dyn Waker>>,
     pub limiter: WakeLimiter,
+    pub ring_limiter: RingLimiter,
 }
 
 impl Push {
@@ -215,7 +276,7 @@ impl Waker for Fcm {
     /// A call says so (2026-09-28): a closed app only shows "something new" for a wake-up, and a
     /// call has to ring. It lives as long as the caller rings, 45 s.
     async fn ring(&self, token: &str, slot: u8) -> Wake {
-        self.send(token, "call", slot, "45s").await
+        self.send(token, "call", slot, &format!("{}s", RING_FOR.as_secs())).await
     }
 }
 
@@ -504,6 +565,58 @@ mod tests {
         assert!(limiter.allow("ft_b"), "each device on its own");
         std::thread::sleep(Duration::from_millis(60));
         assert!(limiter.allow("ft_a"));
+    }
+
+    // A call's push is now or never, and the router cannot tell a caller's retry from a new call.
+    // A retry comes while the phone has not yet answered the first ring by connecting: it rings no
+    // more until the ring has run out. Once the phone connected (it took the call's signal), the
+    // next ring is a new call and goes out, but never sooner than the floor that bounds a flood.
+    #[test]
+    fn a_ring_waits_for_the_phone_to_take_it_or_for_it_to_run_out() {
+        let rings = RingLimiter::new(Duration::from_millis(40), Duration::from_millis(400));
+        assert!(rings.allow("ft_a", 0));
+        assert!(!rings.allow("ft_a", 0), "a retry of the same call");
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(!rings.allow("ft_a", 0), "past the floor, but the phone never took the ring");
+        rings.picked_up("ft_a");
+        assert!(rings.allow("ft_a", 0), "it did now: the next call rings");
+        assert!(!rings.allow("ft_a", 0));
+        std::thread::sleep(Duration::from_millis(420));
+        assert!(rings.allow("ft_a", 0), "a ring that ran out holds nothing back");
+    }
+
+    #[test]
+    fn a_phone_that_took_its_ring_is_rung_again_only_after_the_floor() {
+        let rings = RingLimiter::new(Duration::from_millis(80), Duration::from_secs(5));
+        assert!(rings.allow("ft_a", 0));
+        rings.picked_up("ft_a");
+        assert!(!rings.allow("ft_a", 0), "a flood that the phone keeps answering");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(rings.allow("ft_a", 0));
+    }
+
+    // Each device and slot on its own: a ring held back for one holds back no other, and a phone
+    // that connects took only its own rings.
+    #[test]
+    fn each_device_and_slot_rings_on_its_own() {
+        let rings = RingLimiter::new(Duration::ZERO, Duration::from_secs(5));
+        assert!(rings.allow("ft_a", 0));
+        assert!(rings.allow("ft_a", 5), "another slot");
+        assert!(rings.allow("ft_b", 0), "another device");
+        rings.picked_up("ft_b");
+        assert!(!rings.allow("ft_a", 0), "ft_b connecting takes nothing of ft_a's");
+        assert!(!rings.allow("ft_a", 5));
+        assert!(rings.allow("ft_b", 0));
+        rings.picked_up("ft_a");
+        assert!(rings.allow("ft_a", 0) && rings.allow("ft_a", 5), "connecting takes the rings of every slot");
+    }
+
+    // The production values: a ring holds for as long as FCM keeps it, and the floor is the
+    // same as the wake pace, so a flood rings no more often than it could before 0.5.1.
+    #[test]
+    fn a_ring_holds_for_a_whole_call_and_the_floor_matches_the_wake_pace() {
+        assert_eq!(RING_FOR, Duration::from_secs(45));
+        assert_eq!(RING_EVERY, WAKE_EVERY);
     }
 
     /// What the fake Google saw.

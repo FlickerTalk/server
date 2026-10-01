@@ -298,7 +298,10 @@ fn wake(hub: &Arc<Hub>, device: &str, slot: u8) {
 fn wake_as(hub: &Arc<Hub>, device: &str, slot: u8, call: bool) {
     let Some(push) = hub.push.clone() else { return };
     // Each capability has its own pace: a quiet one never holds back the device's own (app#9).
-    if !push.limiter.allow(&format!("{device}/{slot}")) {
+    // Rings and wakes have theirs too (0.5.1): a call is now or never, so a wake never holds it
+    // back, and a ring never holds back the mail that comes after it.
+    let paced = if call { push.ring_limiter.allow(device, slot) } else { push.limiter.allow(&format!("{device}/{slot}")) };
+    if !paced {
         return;
     }
     let (hub, device) = (hub.clone(), device.to_owned());
@@ -332,6 +335,10 @@ async fn serve(hub: Arc<Hub>, device: String, mut socket: WebSocket) {
         // device goes first, in order: signals sent from now on queue behind it.
         let mut online = hub.online.lock().await;
         online.insert(device.clone(), outbox.clone());
+        // It takes the signals its rings were for: the next call is a new one (0.5.1).
+        if let Some(push) = &hub.push {
+            push.ring_limiter.picked_up(&device);
+        }
         for signal in hub.waiting.take(&device, Instant::now()) {
             let _ = outbox.send(signal_frame(&signal));
         }
