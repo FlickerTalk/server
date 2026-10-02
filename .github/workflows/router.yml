@@ -9,8 +9,18 @@ name: router
 
 on:
   pull_request:
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE*"
+      - ".github/ISSUE_TEMPLATE/**"
   push:
     branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE*"
+      - ".github/ISSUE_TEMPLATE/**"
     tags: ["v*"]
   workflow_dispatch:
 
