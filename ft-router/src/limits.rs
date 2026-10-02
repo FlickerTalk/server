@@ -55,6 +55,16 @@ impl RateLimiter {
         entry.1 += 1;
         entry.1 <= self.limit
     }
+
+    /// Gives back a request `allow` counted but that did not go through, for what must only count
+    /// once done (suggestions, 0.7.0). Taking first and giving back after keeps the cap exact even
+    /// when requests overlap.
+    pub fn refund(&self, key: &str) {
+        let mut counts = self.counts.lock().expect("limiter poisoned");
+        if let Some(entry) = counts.get_mut(key) {
+            entry.1 = entry.1.saturating_sub(1);
+        }
+    }
 }
 
 /// The three limits, and the salt that hides origins.
@@ -101,6 +111,21 @@ mod tests {
         assert!(limiter.allow("b"), "each key on its own");
         std::thread::sleep(Duration::from_millis(70));
         assert!(limiter.allow("a"), "a new window");
+    }
+
+    // Suggestions (0.7.0) count only once delivered: a request that took a slot and then failed
+    // gives it back, and the slot is free again.
+    #[test]
+    fn a_refund_gives_back_a_request_that_did_not_go_through() {
+        let limiter = RateLimiter::new(2, Duration::from_secs(60));
+        assert!(limiter.allow("a"));
+        assert!(limiter.allow("a"));
+        limiter.refund("a");
+        assert!(limiter.allow("a"), "the refunded slot");
+        assert!(!limiter.allow("a"));
+        limiter.refund("b");
+        assert!(limiter.allow("b") && limiter.allow("b"), "a refund for a key never counted gives nothing extra");
+        assert!(!limiter.allow("b"));
     }
 
     #[test]
