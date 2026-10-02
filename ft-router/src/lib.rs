@@ -12,6 +12,7 @@
 pub mod auth;
 pub mod db;
 pub mod limits;
+pub mod mail;
 pub mod turn;
 pub mod waiting;
 pub mod push;
@@ -53,6 +54,8 @@ pub struct Config {
     pub db: Option<Arc<Db>>,
     /// Without it, devices that are not connected are never woken.
     pub push: Option<Arc<Push>>,
+    /// Where suggestions are mailed (0.7.0); without it, `POST /v1/feedback` answers 503.
+    pub mail: Option<Arc<mail::Mailer>>,
     /// The PoC 0 relay (`/poc/rooms/{room}`) forwards anything between whoever joins a room: an
     /// open relay, so it is off unless asked for (`FT_POC_RELAY=1`).
     pub poc_relay: bool,
@@ -71,7 +74,10 @@ pub fn app(config: Config) -> Router {
     let v1 = config
         .db
         .clone()
-        .map(|db| v1::routes(Arc::new(v1::Hub::new(db, config.stun.clone(), config.turn.clone(), config.push.clone(), config.limits))));
+        .map(|db| {
+            let hub = v1::Hub::new(db, config.stun.clone(), config.turn.clone(), config.push.clone(), config.mail.clone(), config.limits);
+            v1::routes(Arc::new(hub))
+        });
     let mut router = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/version", get(|| async { env!("CARGO_PKG_VERSION") }));

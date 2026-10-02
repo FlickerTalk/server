@@ -11,7 +11,8 @@ use ft_router::auth::{device_id, SignedRequest};
 use ft_router::db::Db;
 use ft_router::turn::TurnIssuer;
 use ft_router::push::{apns_target, PushVault, RingLimiter, Wake, WakeLimiter, Waker, APNS, FCM, RING_EVERY, RING_FOR};
-use ft_router::limits::Limits;
+use ft_router::limits::{FeedbackLimits, Limits};
+use ft_router::mail::Mailer;
 use ft_router::{app, Config, Push};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -41,6 +42,14 @@ async fn router_limited(limits: Limits) -> Router {
 }
 
 async fn router_configured(push: Option<Arc<Push>>, limits: Limits) -> Router {
+    router_built(push, None, limits).await
+}
+
+async fn router_mailing(mail: Option<Arc<Mailer>>, limits: Limits) -> Router {
+    router_built(None, mail, limits).await
+}
+
+async fn router_built(push: Option<Arc<Push>>, mail: Option<Arc<Mailer>>, limits: Limits) -> Router {
     let url = std::env::var("FT_TEST_DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:test@127.0.0.1:55432/ft_router_test".to_owned());
     let db = Arc::new(Db::connect_isolated(&url).await.expect("test database"));
@@ -49,6 +58,7 @@ async fn router_configured(push: Option<Arc<Push>>, limits: Limits) -> Router {
         turn: Some(TurnIssuer::new(b"secret".to_vec(), vec!["turn:turn.example:3478".to_owned()], Duration::from_secs(600))),
         db: Some(db.clone()),
         push,
+        mail,
         poc_relay: false,
         limits,
     };
@@ -549,7 +559,7 @@ async fn an_expired_push_token_is_forgotten() {
 }
 
 fn limits(per_device: u32, per_recipient: u32, per_origin: u32) -> Limits {
-    Limits { per_device, per_recipient, per_origin, window: Duration::from_secs(60) }
+    Limits { per_device, per_recipient, per_origin, window: Duration::from_secs(60), ..Limits::default() }
 }
 
 // §91: each device, recipient and origin gets a fair share; beyond it, 429 until the next minute.
@@ -1484,4 +1494,371 @@ async fn a_retained_signal_is_dropped_if_its_session_was_left_before_the_hand_ov
     let mut socket = bob.connect(&router).await;
     assert_eq!(next_json(&mut socket).await["kind"], "welcome");
     assert!(nothing_more(&mut socket).await);
+}
+
+/// One mail as the fake mail server took it: who it was for, and the message as sent.
+#[derive(Clone, Debug)]
+struct Sent {
+    recipients: Vec<String>,
+    data: String,
+}
+
+impl Sent {
+    fn headers(&self) -> Vec<(String, String)> {
+        let (headers, _) = self.data.split_once("\r\n\r\n").expect("headers and body");
+        headers
+            .split("\r\n")
+            .filter(|line| !line.starts_with([' ', '\t']))
+            .map(|line| {
+                let (name, value) = line.split_once(':').expect("a header");
+                (name.to_ascii_lowercase(), value.trim().to_owned())
+            })
+            .collect()
+    }
+
+    fn header(&self, name: &str) -> Vec<String> {
+        self.headers().into_iter().filter(|(found, _)| found == name).map(|(_, value)| value).collect()
+    }
+
+    /// The text, decoded, with its line breaks as `\n` (MIME sends text with CRLF).
+    fn text(&self) -> String {
+        assert_eq!(self.header("content-transfer-encoding"), ["base64"]);
+        let (_, body) = self.data.split_once("\r\n\r\n").expect("headers and body");
+        let body: String = body.split_whitespace().collect();
+        let bytes = base64::engine::general_purpose::STANDARD.decode(body).expect("base64");
+        String::from_utf8(bytes).expect("UTF-8").replace("\r\n", "\n")
+    }
+}
+
+/// A mail server on 127.0.0.1 that speaks just enough SMTP, keeps what it is sent, and can be
+/// switched off (it then turns every connection away).
+struct FakeSmtp {
+    port: u16,
+    sent: Arc<std::sync::Mutex<Vec<Sent>>>,
+    up: Arc<std::sync::atomic::AtomicBool>,
+    /// When set, a mail's final answer waits until the test says whether it is taken.
+    hold: Arc<std::sync::atomic::AtomicBool>,
+    held: Arc<std::sync::Mutex<Vec<tokio::sync::oneshot::Sender<bool>>>>,
+}
+
+impl FakeSmtp {
+    async fn start() -> Self {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("binds");
+        let port = listener.local_addr().expect("address").port();
+        let sent: Arc<std::sync::Mutex<Vec<Sent>>> = Arc::default();
+        let up = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let hold = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let held: Arc<std::sync::Mutex<Vec<tokio::sync::oneshot::Sender<bool>>>> = Arc::default();
+        let (keep, running, holding, waiting) = (sent.clone(), up.clone(), hold.clone(), held.clone());
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let (keep, running, holding, waiting) = (keep.clone(), running.clone(), holding.clone(), waiting.clone());
+                tokio::spawn(async move {
+                    let (read, mut write) = socket.into_split();
+                    if !running.load(std::sync::atomic::Ordering::SeqCst) {
+                        let _ = write.write_all(b"421 down\r\n").await;
+                        return;
+                    }
+                    let mut lines = BufReader::new(read).lines();
+                    let _ = write.write_all(b"220 fake\r\n").await;
+                    let mut recipients = Vec::new();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let command = line.to_ascii_uppercase();
+                        let answer: &[u8] = if command.starts_with("RCPT TO:") {
+                            recipients.push(line[8..].to_owned());
+                            b"250 ok\r\n"
+                        } else if command == "DATA" {
+                            let _ = write.write_all(b"354 go on\r\n").await;
+                            let mut data = Vec::new();
+                            while let Ok(Some(line)) = lines.next_line().await {
+                                if line == "." {
+                                    break;
+                                }
+                                data.push(line.strip_prefix('.').map(str::to_owned).unwrap_or(line));
+                            }
+                            if holding.load(std::sync::atomic::Ordering::SeqCst) {
+                                let (decide, decision) = tokio::sync::oneshot::channel();
+                                waiting.lock().unwrap().push(decide);
+                                if !decision.await.unwrap_or(false) {
+                                    let _ = write.write_all(b"554 refused\r\n").await;
+                                    recipients.clear();
+                                    continue;
+                                }
+                            }
+                            keep.lock().unwrap().push(Sent { recipients: std::mem::take(&mut recipients), data: data.join("\r\n") });
+                            b"250 queued\r\n"
+                        } else if command == "QUIT" {
+                            let _ = write.write_all(b"221 bye\r\n").await;
+                            return;
+                        } else {
+                            b"250 ok\r\n"
+                        };
+                        if write.write_all(answer).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        Self { port, sent, up, hold, held }
+    }
+
+    fn mailer(&self) -> Option<Arc<Mailer>> {
+        Some(Arc::new(Mailer::plaintext_loopback(self.port, "info@flickertalk.com", "info@flickertalk.com").expect("a mailer")))
+    }
+
+    fn sent(&self) -> Vec<Sent> {
+        self.sent.lock().unwrap().clone()
+    }
+
+    fn switch(&self, up: bool) {
+        self.up.store(up, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// From now on, mails wait for `release` before they are answered.
+    fn hold(&self, hold: bool) {
+        self.hold.store(hold, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn held(&self) -> usize {
+        self.held.lock().unwrap().len()
+    }
+
+    /// Answers every mail held: taken, or refused.
+    fn release(&self, taken: bool) {
+        for decide in self.held.lock().unwrap().drain(..) {
+            let _ = decide.send(taken);
+        }
+    }
+}
+
+fn suggestion(text: &str, app: &str, platform: &str) -> Vec<u8> {
+    serde_json::to_vec(&json!({ "text": text, "app": app, "platform": platform })).unwrap()
+}
+
+impl Device {
+    async fn suggest(&self, router: &Router, body: Vec<u8>) -> u16 {
+        self.request(router, "POST", "/v1/feedback", body).await.status().as_u16()
+    }
+}
+
+/// A router that mails suggestions to the fake server, with production caps, and a registered
+/// device.
+async fn mailing_router() -> (Router, FakeSmtp, Device) {
+    let smtp = FakeSmtp::start().await;
+    let router = router_mailing(smtp.mailer(), Limits::default()).await;
+    let alice = Device::new(1);
+    assert_eq!(alice.register(&router).await.status(), 204);
+    (router, smtp, alice)
+}
+
+// Suggestions (0.7.0): the text reaches the project's mailbox, with the app's version and platform
+// in the subject, and nothing is kept.
+#[tokio::test]
+async fn a_suggestion_arrives_by_mail_with_the_app_version_and_platform() {
+    let (router, smtp, alice) = mailing_router().await;
+    assert_eq!(alice.suggest(&router, suggestion("  Dark mode, please.\n", "1.3.0", "android")).await, 204);
+    let sent = smtp.sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].recipients, ["<info@flickertalk.com>"]);
+    assert_eq!(sent[0].header("subject"), ["FlickerTalk suggestion (android 1.3.0)"]);
+    assert_eq!(sent[0].header("from"), ["info@flickertalk.com"]);
+    assert_eq!(sent[0].header("to"), ["info@flickertalk.com"]);
+    assert_eq!(sent[0].text(), "Dark mode, please.", "without the blanks around it");
+}
+
+#[tokio::test]
+async fn a_suggestion_mail_never_carries_the_device_id() {
+    let (router, smtp, alice) = mailing_router().await;
+    assert_eq!(alice.suggest(&router, suggestion("Stickers", "1.3.0", "ios")).await, 204);
+    let sent = &smtp.sent()[0];
+    let id = alice.id();
+    assert!(!sent.data.contains(&id), "not in any header nor in the raw body");
+    assert!(!sent.text().contains(&id));
+    assert!(!sent.data.contains(&id["ft_".len()..]), "not even without its prefix");
+    assert!(!sent.data.contains(&STANDARD_NO_PAD.encode(alice.key.verifying_key().to_bytes())), "nor its key");
+}
+
+#[tokio::test]
+async fn an_unsigned_suggestion_is_refused_and_sends_nothing() {
+    let (router, smtp, alice) = mailing_router().await;
+    let unsigned = router.http.post(format!("{}/v1/feedback", router.base)).body(suggestion("hi", "1.3.0", "android")).send().await;
+    assert_eq!(unsigned.unwrap().status(), 401);
+    // Signed for another text.
+    let mut forged = router.http.post(format!("{}/v1/feedback", router.base)).body(suggestion("spam", "1.3.0", "android"));
+    for (name, value) in alice.sign("POST", "/v1/feedback", &suggestion("hi", "1.3.0", "android"), "n-1") {
+        forged = forged.header(name, value);
+    }
+    assert_eq!(forged.send().await.unwrap().status(), 401);
+    assert_eq!(Device::new(9).suggest(&router, suggestion("hi", "1.3.0", "android")).await, 401, "a device never registered");
+    assert!(smtp.sent().is_empty());
+}
+
+#[tokio::test]
+async fn a_device_sends_three_suggestions_a_day_and_another_can_still_send() {
+    let (router, smtp, alice) = mailing_router().await;
+    let bob = Device::new(2);
+    bob.register(&router).await;
+    let mut statuses = Vec::new();
+    for n in 0..4 {
+        statuses.push(alice.suggest(&router, suggestion(&format!("idea {n}"), "1.3.0", "android")).await);
+    }
+    assert_eq!(statuses, [204, 204, 204, 429]);
+    assert_eq!(bob.suggest(&router, suggestion("mine", "1.3.0", "ios")).await, 204);
+    assert_eq!(smtp.sent().len(), 4, "the refused one was not mailed");
+}
+
+#[tokio::test]
+async fn above_the_total_cap_suggestions_are_refused() {
+    let smtp = FakeSmtp::start().await;
+    let feedback = FeedbackLimits { per_device: 3, total: 2, window: Duration::from_secs(60) };
+    let router = router_mailing(smtp.mailer(), Limits { feedback, ..Limits::default() }).await;
+    let (alice, bob, carol) = (Device::new(1), Device::new(2), Device::new(3));
+    for device in [&alice, &bob, &carol] {
+        device.register(&router).await;
+    }
+    assert_eq!(alice.suggest(&router, suggestion("one", "1.3.0", "android")).await, 204);
+    assert_eq!(bob.suggest(&router, suggestion("two", "1.3.0", "android")).await, 204);
+    assert_eq!(carol.suggest(&router, suggestion("three", "1.3.0", "android")).await, 429);
+    assert_eq!(alice.suggest(&router, suggestion("four", "1.3.0", "android")).await, 429);
+    assert_eq!(smtp.sent().len(), 2);
+}
+
+#[tokio::test]
+async fn a_malformed_suggestion_is_refused_and_spends_nothing() {
+    let (router, smtp, alice) = mailing_router().await;
+    let refused = [
+        suggestion("", "1.3.0", "android"),
+        suggestion(" \n\t ", "1.3.0", "android"),
+        suggestion(&"a".repeat(2001), "1.3.0", "android"),
+        suggestion(&"👋".repeat(2001), "1.3.0", "android"),
+        suggestion("hi", "1.3.0", "symbian"),
+        suggestion("hi", "1.3.0", "Android"),
+        suggestion("hi", "1.3.0\r\nBcc: a@b.c", "android"),
+        suggestion("hi", "1.3.0 beta", "android"),
+        suggestion("hi", "", "android"),
+        suggestion("hi", "1..3", "android"),
+        suggestion("hi", "1.2.3.4.5", "android"),
+        suggestion("hi", "12345678.12345678", "android"),
+        b"{\"text\": \"hi\", \"app\": \"1.3.0\"".to_vec(),
+        serde_json::to_vec(&json!({ "text": "hi", "platform": "android" })).unwrap(),
+        serde_json::to_vec(&json!({ "text": 7, "app": "1.3.0", "platform": "android" })).unwrap(),
+    ];
+    for body in refused {
+        let shown = String::from_utf8_lossy(&body).chars().take(60).collect::<String>();
+        assert_eq!(alice.suggest(&router, body).await, 400, "{shown}");
+    }
+    assert!(smtp.sent().is_empty());
+    for app in ["1", "1.3", "10.20.30.4000"] {
+        assert_eq!(alice.suggest(&router, suggestion("still mine", app, "ios")).await, 204, "{app}");
+    }
+    assert_eq!(alice.suggest(&router, suggestion("one more", "1.3.0", "ios")).await, 429, "the refused ones cost nothing");
+    let platforms = ["android", "ios", "macos", "windows", "linux"];
+    for (seed, platform) in (10..).zip(platforms) {
+        let device = Device::new(seed);
+        device.register(&router).await;
+        assert_eq!(device.suggest(&router, suggestion("hi", "1.3.0", platform)).await, 204, "{platform}");
+    }
+}
+
+// Retrying while the mail server is down must not leave the user without a suggestion for the day.
+#[tokio::test]
+async fn while_the_mail_server_is_down_suggestions_fail_and_spend_nothing() {
+    let (router, smtp, alice) = mailing_router().await;
+    smtp.switch(false);
+    for _ in 0..3 {
+        assert_eq!(alice.suggest(&router, suggestion("hello?", "1.3.0", "android")).await, 503);
+    }
+    smtp.switch(true);
+    for _ in 0..3 {
+        assert_eq!(alice.suggest(&router, suggestion("hello", "1.3.0", "android")).await, 204);
+    }
+    assert_eq!(alice.suggest(&router, suggestion("hello", "1.3.0", "android")).await, 429);
+    assert_eq!(smtp.sent().len(), 3);
+}
+
+#[tokio::test]
+async fn without_mail_settings_suggestions_are_unavailable() {
+    let router = router_mailing(None, Limits::default()).await;
+    let alice = Device::new(1);
+    alice.register(&router).await;
+    assert_eq!(alice.suggest(&router, suggestion("hi", "1.3.0", "android")).await, 503);
+    assert_eq!(alice.request(&router, "GET", "/v1/mailbox", vec![]).await.status(), 200, "the rest is unchanged");
+}
+
+// Characters, not bytes: 2000 of them in several scripts and with line breaks arrive as written.
+#[tokio::test]
+async fn long_texts_in_any_script_arrive_intact() {
+    let (router, smtp, alice) = mailing_router().await;
+    let letters = ['👋', 'م', 'ر', '\n', 'é', '中', 'ж'];
+    let text: String = (0..2000).map(|i| letters[i % letters.len()]).collect();
+    assert_eq!(text.chars().count(), 2000);
+    assert!(text.len() > 4000, "far more bytes than characters");
+    assert!(!text.ends_with('\n'));
+    assert_eq!(alice.suggest(&router, suggestion(&format!("\n  {text}  \n"), "1.3.0", "android")).await, 204);
+    assert_eq!(smtp.sent()[0].text(), text);
+}
+
+// A text that looks like mail stays text: it adds no header or recipient and does not end the mail.
+#[tokio::test]
+async fn a_text_that_looks_like_mail_headers_stays_in_the_body() {
+    let (router, smtp, alice) = mailing_router().await;
+    let text = "Hello\r\nSubject: x\r\nBcc: a@b.c\r\n\r\n.\r\nRCPT TO:<b@c.d>\r\nafter the dot";
+    assert_eq!(alice.suggest(&router, suggestion(text, "1.3.0", "android")).await, 204);
+    let sent = smtp.sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].recipients, ["<info@flickertalk.com>"]);
+    assert_eq!(sent[0].header("subject"), ["FlickerTalk suggestion (android 1.3.0)"]);
+    assert!(sent[0].header("bcc").is_empty());
+    assert_eq!(sent[0].text(), text.replace("\r\n", "\n"));
+}
+
+// The caps count "delivered plus in flight". Two delivered; A is in flight with the third slot;
+// B, arriving meanwhile, is refused; A then fails. The device has two delivered and one to go.
+#[tokio::test]
+async fn a_suggestion_refused_while_another_is_in_flight_leaves_no_trace() {
+    let (router, smtp, alice) = mailing_router().await;
+    for n in 0..2 {
+        assert_eq!(alice.suggest(&router, suggestion(&format!("idea {n}"), "1.3.0", "android")).await, 204);
+    }
+    smtp.hold(true);
+    let in_flight = {
+        let (base, http) = (router.base.clone(), router.http.clone());
+        let body = suggestion("A", "1.3.0", "android");
+        let mut request = http.post(format!("{base}/v1/feedback")).body(body.clone());
+        for (name, value) in alice.sign("POST", "/v1/feedback", &body, "in-flight") {
+            request = request.header(name, value);
+        }
+        tokio::spawn(async move { request.send().await.expect("answers").status().as_u16() })
+    };
+    assert!(soon(|| smtp.held() == 1).await, "A reached the mail server");
+    assert_eq!(alice.suggest(&router, suggestion("B", "1.3.0", "android")).await, 429);
+    smtp.release(false);
+    assert_eq!(in_flight.await.unwrap(), 503);
+    smtp.hold(false);
+    assert_eq!(alice.suggest(&router, suggestion("C", "1.3.0", "android")).await, 204, "two delivered, one to go");
+    assert_eq!(alice.suggest(&router, suggestion("D", "1.3.0", "android")).await, 429);
+    assert_eq!(smtp.sent().len(), 3);
+}
+
+// The body of a suggestion is bounded (32 KiB): beyond it, 413 before anything is parsed, no mail
+// and no quota spent. The bound still fits 2000 characters escaped the costliest way JSON allows.
+#[tokio::test]
+async fn a_suggestion_body_over_32_kib_is_refused_and_spends_nothing() {
+    let (router, smtp, alice) = mailing_router().await;
+    let oversized = suggestion(&"a".repeat(32 * 1024), "1.3.0", "android");
+    assert_eq!(alice.suggest(&router, oversized).await, 413);
+    assert!(smtp.sent().is_empty());
+
+    let text = "👋".repeat(2000);
+    let escaped: String = text.encode_utf16().map(|unit| format!("\\u{unit:04x}")).collect();
+    let body = format!(r#"{{"text":"{escaped}","app":"1.3.0","platform":"android"}}"#).into_bytes();
+    assert!(body.len() > 24_000 && body.len() <= 32 * 1024);
+    assert_eq!(alice.suggest(&router, body).await, 204);
+    assert_eq!(smtp.sent()[0].text(), text);
+    for _ in 0..2 {
+        assert_eq!(alice.suggest(&router, suggestion("more", "1.3.0", "android")).await, 204);
+    }
+    assert_eq!(alice.suggest(&router, suggestion("more", "1.3.0", "android")).await, 429, "the 413 cost nothing");
 }
