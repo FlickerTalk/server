@@ -65,6 +65,26 @@ impl RateLimiter {
 
     /// Counts one request; `false` once the key is over its limit in this window.
     pub fn allow(&self, key: &str) -> bool {
+        self.count(key, |count, limit| {
+            *count += 1;
+            *count <= limit
+        })
+    }
+
+    /// Like `allow`, but a refused request is not counted, so with `refund` the count is exactly
+    /// what went through plus what is in flight (suggestions, 0.7.0).
+    pub fn take(&self, key: &str) -> bool {
+        self.count(key, |count, limit| {
+            let admitted = *count < limit;
+            if admitted {
+                *count += 1;
+            }
+            admitted
+        })
+    }
+
+    /// Runs `decide` on the key's count in the current window, starting a new window when due.
+    fn count(&self, key: &str, decide: impl FnOnce(&mut u32, u32) -> bool) -> bool {
         let mut counts = self.counts.lock().expect("limiter poisoned");
         let now = Instant::now();
         if counts.len() > SWEEP_ABOVE {
@@ -74,11 +94,10 @@ impl RateLimiter {
         if now.duration_since(entry.0) >= self.window {
             *entry = (now, 0);
         }
-        entry.1 += 1;
-        entry.1 <= self.limit
+        decide(&mut entry.1, self.limit)
     }
 
-    /// Gives back a request `allow` counted but that did not go through, for what must only count
+    /// Gives back a request `take` counted but that did not go through, for what must only count
     /// once done (suggestions, 0.7.0). Taking first and giving back after keeps the cap exact even
     /// when requests overlap.
     pub fn refund(&self, key: &str) {
@@ -154,6 +173,20 @@ mod tests {
         limiter.refund("b");
         assert!(limiter.allow("b") && limiter.allow("b"), "a refund for a key never counted gives nothing extra");
         assert!(!limiter.allow("b"));
+    }
+
+    // The count must be "delivered plus in flight". Two delivered; A takes the third slot; B,
+    // arriving meanwhile, is refused and must leave no trace; A fails and gives its slot back: the
+    // device, with two delivered, still has one to go.
+    #[test]
+    fn a_refused_take_is_not_counted() {
+        let limiter = RateLimiter::new(3, Duration::from_secs(60));
+        assert!(limiter.take("a") && limiter.take("a"), "two delivered");
+        assert!(limiter.take("a"), "A in flight");
+        assert!(!limiter.take("a"), "B refused");
+        limiter.refund("a");
+        assert!(limiter.take("a"), "the slot A gave back");
+        assert!(!limiter.take("a"));
     }
 
     #[test]
