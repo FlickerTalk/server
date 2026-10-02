@@ -4,6 +4,7 @@ use std::time::Duration;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use ft_router::db::Db;
+use ft_router::mail::{self, Mailer};
 use ft_router::push::{Apns, Fcm, PushVault, RingLimiter, ServiceAccount, Waker, WakeLimiter, APNS, FCM, RING_EVERY, RING_FOR, WAKE_EVERY};
 use ft_router::turn::TurnIssuer;
 use ft_router::{Config, Push};
@@ -88,6 +89,43 @@ fn push_from(key: Option<Vec<u8>>, service_account: Option<Vec<u8>>, apns: Optio
     }))
 }
 
+/// Where suggestions are mailed (0.7.0): the SMTP server, always over STARTTLS, the account that
+/// sends them and the mailbox they go to.
+struct MailSetup {
+    host: String,
+    port: u16,
+    user: String,
+    password: String,
+    to: String,
+}
+
+impl MailSetup {
+    fn mailer(&self) -> anyhow::Result<Mailer> {
+        Mailer::starttls(&self.host, self.port, &self.user, &self.password, &self.to)
+    }
+}
+
+/// `FT_SMTP_HOST`, `FT_SMTP_PORT` (587 by default), `FT_SMTP_USER`, the contents of
+/// `FT_SMTP_PASSWORD_FILE` and `FT_FEEDBACK_TO` (the user by default). Without the host, the user
+/// or the password, suggestions are not mailed.
+fn mail_setup(
+    host: Option<String>,
+    port: Option<String>,
+    user: Option<String>,
+    password: Option<Vec<u8>>,
+    to: Option<String>,
+) -> anyhow::Result<Option<MailSetup>> {
+    let given = |value: Option<String>| value.filter(|value| !value.is_empty());
+    let (Some(host), Some(user), Some(password)) = (given(host), given(user), password) else { return Ok(None) };
+    let port = match given(port) {
+        Some(port) => port.parse()?,
+        None => mail::DEFAULT_PORT,
+    };
+    let password = String::from_utf8(password.trim_ascii_end().to_vec())?;
+    let to = given(to).unwrap_or_else(|| user.clone());
+    Ok(Some(MailSetup { host, port, user, password, to }))
+}
+
 /// Expired mail is deleted every hour (§19).
 const PURGE_EVERY: Duration = Duration::from_secs(60 * 60);
 
@@ -120,6 +158,9 @@ async fn main() -> anyhow::Result<()> {
         _ => None,
     };
     config.push = push_from(push_key, service_account, apns)?.map(Arc::new);
+    let smtp_password = variable("FT_SMTP_PASSWORD_FILE").map(std::fs::read).transpose()?;
+    let mail = mail_setup(variable("FT_SMTP_HOST"), variable("FT_SMTP_PORT"), variable("FT_SMTP_USER"), smtp_password, variable("FT_FEEDBACK_TO"))?;
+    config.mail = mail.map(|setup| setup.mailer()).transpose()?.map(Arc::new);
 
     let listener = TcpListener::bind(listen_address(variable("FT_ROUTER_ADDR"))).await?;
     axum::serve(listener, ft_router::app(config)).await?;
@@ -212,6 +253,28 @@ mod tests {
         let issued = config.turn.expect("TURN is configured").issue(SystemTime::now());
         assert_eq!(issued.urls, ["turn:a:3478"]);
         assert_eq!(issued.credential, credential_for(b"abc", &issued.username));
+    }
+
+    // Suggestions (0.7.0): mail needs the host, the user and the password; without any of them the
+    // endpoint answers 503 and nothing else changes. The password is a Swarm secret file.
+    #[test]
+    fn mail_is_on_only_with_its_host_user_and_password() {
+        let some = |text: &str| Some(text.to_owned());
+        let password = || Some(b"hunter2\n".to_vec());
+        let setup = mail_setup(some("ssl0.ovh.net"), None, some("info@flickertalk.com"), password(), None).unwrap().expect("on");
+        assert_eq!((setup.host.as_str(), setup.port), ("ssl0.ovh.net", 587), "STARTTLS submission by default");
+        assert_eq!(setup.password, "hunter2");
+        assert_eq!(setup.to, "info@flickertalk.com", "to the user's own mailbox by default");
+        let other = mail_setup(some("h"), some("2525"), some("a@b.c"), password(), some("d@e.f")).unwrap().expect("on");
+        assert_eq!((other.port, other.to.as_str()), (2525, "d@e.f"));
+        assert!(mail_setup(None, None, some("a@b.c"), password(), None).unwrap().is_none());
+        assert!(mail_setup(some(""), None, some("a@b.c"), password(), None).unwrap().is_none(), "an empty variable is no host");
+        assert!(mail_setup(some("h"), None, None, password(), None).unwrap().is_none());
+        assert!(mail_setup(some("h"), None, some("a@b.c"), None, None).unwrap().is_none());
+        assert!(mail_setup(some("h"), some("smtp"), some("a@b.c"), password(), None).is_err(), "a wrong port is an error, not silence");
+        assert!(setup.mailer().is_ok());
+        let wrong = mail_setup(some("h"), None, some("info"), password(), None).unwrap().expect("on");
+        assert!(wrong.mailer().is_err(), "so is a user that is not an address");
     }
 
     #[test]
