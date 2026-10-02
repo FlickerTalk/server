@@ -13,6 +13,7 @@ so it cannot read them. [flickertalk.com](https://flickertalk.com)
 | Which of the phone's eight routing codes are silent: eight bits, nothing else | Keep a session the user has left unreachable | Replaced at every registration; until the user erases the phone |
 | Undelivered messages, end-to-end encrypted, without sender, each with the number (0–7) of the routing code it came through | Deliver them later; hold back those for a session the user has left; give each routing code its own quota | Until picked up, at most 7 days |
 | Connection offers and answers for a phone that is not connected, end-to-end encrypted | Hand them over as soon as it connects | In memory only, never on disk: until it connects, at most 55 seconds |
+| How many suggestions each device has sent in the last 24 hours | Limit suggestions | In memory only, never on disk or in a log |
 
 A signal for a phone that is not connected is answered `404` with `ft-retained: 1`: the router
 wakes the phone and holds the signal in memory (eight per phone and 32 MiB in all, the oldest
@@ -41,6 +42,19 @@ has.
 Each routing code has its own mailbox quota: up to 1000 messages waiting through the main list and
 200 through each other code, so a session whose mail is withheld cannot fill the main list's. A full
 code answers `507` for that code only, exactly as a full mailbox does, silent or not.
+
+## Suggestions
+
+`POST /v1/feedback`, signed like every other request, takes `{"text", "app", "platform"}`: a
+suggestion typed in the app (1 to 2000 characters), the app's version and its platform. The router
+forwards the text by email to the project's mailbox and does not store it: nothing goes to the
+database or to a log. The mail carries the text, the version and the platform in its subject, and
+no device ID, nor the phone's IP address or clock. While it handles the request the router sees
+which device sent it, as with any signed request, to check the signature and the limits: three
+suggestions per device and 200 in all every 24 hours, counting only those delivered. It answers
+`204` once the mail server has taken the mail, `400` for a malformed suggestion, `429` over a limit
+and `503` when mail is not set up or the mail server did not take it. The router always talks to
+the mail server over STARTTLS.
 
 No conversations, no contacts, no history, no access logs, no IP logs. There are no `/messages`,
 `/conversations`, `/users` or `/profiles` endpoints, and there never will be.
