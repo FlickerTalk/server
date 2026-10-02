@@ -18,11 +18,33 @@ pub struct Limits {
     /// Registrations, signals and mail per origin.
     pub per_origin: u32,
     pub window: Duration,
+    pub feedback: FeedbackLimits,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { per_device: 600, per_recipient: 240, per_origin: 1200, window: Duration::from_secs(60) }
+        Self {
+            per_device: 600,
+            per_recipient: 240,
+            per_origin: 1200,
+            window: Duration::from_secs(60),
+            feedback: FeedbackLimits::default(),
+        }
+    }
+}
+
+/// Suggestions (0.7.0): a few per device and a cap on them all, so that neither a bug nor an
+/// attack fills the mailbox. Only those delivered count.
+#[derive(Debug, Clone, Copy)]
+pub struct FeedbackLimits {
+    pub per_device: u32,
+    pub total: u32,
+    pub window: Duration,
+}
+
+impl Default for FeedbackLimits {
+    fn default() -> Self {
+        Self { per_device: 3, total: 200, window: Duration::from_secs(24 * 60 * 60) }
     }
 }
 
@@ -72,15 +94,21 @@ pub struct Limiters {
     pub device: RateLimiter,
     pub recipient: RateLimiter,
     pub origin: RateLimiter,
+    /// Suggestions per device, and all of them under one key.
+    pub feedback_device: RateLimiter,
+    pub feedback_total: RateLimiter,
     salt: [u8; 32],
 }
 
 impl Limiters {
     pub fn new(limits: Limits) -> Self {
+        let feedback = limits.feedback;
         Self {
             device: RateLimiter::new(limits.per_device, limits.window),
             recipient: RateLimiter::new(limits.per_recipient, limits.window),
             origin: RateLimiter::new(limits.per_origin, limits.window),
+            feedback_device: RateLimiter::new(feedback.per_device, feedback.window),
+            feedback_total: RateLimiter::new(feedback.total, feedback.window),
             salt: rand::random(),
         }
     }

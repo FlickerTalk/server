@@ -28,6 +28,9 @@
 //! - `PUT /v1/device/push`, `DELETE /v1/device/push`: signed; where the device can be woken, kept
 //!   encrypted (§8). A device that is not connected is woken when a signal or mail arrives for it,
 //!   with nothing in the push (§12).
+//! - `POST /v1/feedback` (0.7.0): signed; a suggestion, mailed to the project's mailbox without
+//!   the device id and kept nowhere. Three per device and 200 in all per 24 h, counting only those
+//!   delivered; 503 when mail is not set up or the mail server did not take it.
 //!
 //! Requests are limited per device, per recipient and per origin (`limits.rs`, §91): 429 beyond.
 //!
@@ -55,6 +58,7 @@ use tokio::sync::{mpsc, Mutex};
 use crate::auth::{self, decode_base64, ReplayGuard, SignedRequest, STANDARD_NO_PAD};
 use crate::db::{Db, Route, MAX_BLOB};
 use crate::limits::{Limiters, Limits};
+use crate::mail::Mailer;
 use crate::push::{silent, Push, Wake, MAX_TOKEN};
 use crate::turn::TurnIssuer;
 use crate::waiting::{Retention, Waiting, SWEEP_EVERY};
@@ -76,11 +80,19 @@ pub struct Hub {
     stun: Vec<String>,
     turn: Option<TurnIssuer>,
     push: Option<Arc<Push>>,
+    mail: Option<Arc<Mailer>>,
     limiters: Limiters,
 }
 
 impl Hub {
-    pub fn new(db: Arc<Db>, stun: Vec<String>, turn: Option<TurnIssuer>, push: Option<Arc<Push>>, limits: Limits) -> Self {
+    pub fn new(
+        db: Arc<Db>,
+        stun: Vec<String>,
+        turn: Option<TurnIssuer>,
+        push: Option<Arc<Push>>,
+        mail: Option<Arc<Mailer>>,
+        limits: Limits,
+    ) -> Self {
         Self {
             db,
             guard: ReplayGuard::default(),
@@ -89,6 +101,7 @@ impl Hub {
             stun,
             turn,
             push,
+            mail,
             limiters: Limiters::new(limits),
         }
     }
@@ -124,6 +137,7 @@ pub fn routes(hub: Arc<Hub>) -> Router {
         .route("/v1/mailbox", get(collect))
         .route("/v1/mailbox/{target}", post(deposit).delete(acknowledge))
         .route("/v1/turn-credentials", get(turn_credentials))
+        .route("/v1/feedback", post(feedback))
         .with_state(hub)
 }
 
@@ -486,6 +500,65 @@ async fn turn_credentials(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Re
     authenticate(&hub, "GET", "/v1/turn-credentials", Signature::from_headers(&headers), b"", None).await?;
     let issuer = hub.turn.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     Ok(Json(serde_json::to_value(issuer.issue(SystemTime::now())).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?))
+}
+
+/// Where a suggestion may come from: the phones, and the desktop builds used in development.
+const PLATFORMS: [&str; 5] = ["android", "ios", "macos", "windows", "linux"];
+/// Characters, not bytes, once the blanks around the text are gone.
+const MAX_SUGGESTION: usize = 2000;
+/// The key all suggestions share for the total cap.
+const ALL_SUGGESTIONS: &str = "all";
+
+#[derive(Deserialize)]
+struct Suggestion {
+    text: String,
+    app: String,
+    platform: String,
+}
+
+impl Suggestion {
+    /// The subject and the text to mail, if the suggestion is well formed. The version and the
+    /// platform go in the subject, so they are held to digits and dots and to a closed list: no
+    /// line break can slip into a header. The text only ever goes in the body.
+    fn mail(&self) -> Option<(String, &str)> {
+        let text = self.text.trim();
+        let characters = text.chars().count();
+        let well_formed = (1..=MAX_SUGGESTION).contains(&characters)
+            && app_version(&self.app)
+            && PLATFORMS.contains(&self.platform.as_str());
+        well_formed.then(|| (format!("FlickerTalk suggestion ({} {})", self.platform, self.app), text))
+    }
+}
+
+/// `^[0-9]+(\.[0-9]+){0,3}$`, 16 characters at most.
+fn app_version(version: &str) -> bool {
+    version.len() <= 16
+        && version.split('.').count() <= 4
+        && version.split('.').all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// A suggestion (0.7.0), mailed to the project's mailbox and kept nowhere: neither the text nor
+/// who sent it goes to the database, a log or the mail. Only a delivered one counts against the
+/// caps, so a refused or failed one costs the user nothing.
+async fn feedback(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: Bytes) -> Result<StatusCode, StatusCode> {
+    let device = authenticate(&hub, "POST", "/v1/feedback", Signature::from_headers(&headers), &body, None).await?;
+    let suggestion: Suggestion = serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let (subject, text) = suggestion.mail().ok_or(StatusCode::BAD_REQUEST)?;
+    let mail = hub.mail.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let limiters = &hub.limiters;
+    if !limiters.feedback_device.allow(&device) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    if !limiters.feedback_total.allow(ALL_SUGGESTIONS) {
+        limiters.feedback_device.refund(&device);
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    if mail.send(&subject, text).await.is_err() {
+        limiters.feedback_device.refund(&device);
+        limiters.feedback_total.refund(ALL_SUGGESTIONS);
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]
