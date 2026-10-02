@@ -12,6 +12,7 @@
 pub mod auth;
 pub mod db;
 pub mod limits;
+pub mod mail;
 pub mod turn;
 pub mod waiting;
 pub mod push;

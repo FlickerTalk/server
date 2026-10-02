@@ -17,6 +17,8 @@ ed25519-dalek = "3"
 futures-util = "0.3"
 hmac = "0.12"
 jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
+# Suggestions by mail (0.7.0): SMTP over tokio and rustls with ring and the webpki roots, like reqwest.
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "tokio1-rustls", "ring", "webpki-roots"] }
 rand = "0.9"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "form", "http2"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
