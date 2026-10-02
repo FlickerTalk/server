@@ -1536,6 +1536,9 @@ struct FakeSmtp {
     port: u16,
     sent: Arc<std::sync::Mutex<Vec<Sent>>>,
     up: Arc<std::sync::atomic::AtomicBool>,
+    /// When set, a mail's final answer waits until the test says whether it is taken.
+    hold: Arc<std::sync::atomic::AtomicBool>,
+    held: Arc<std::sync::Mutex<Vec<tokio::sync::oneshot::Sender<bool>>>>,
 }
 
 impl FakeSmtp {
@@ -1545,10 +1548,12 @@ impl FakeSmtp {
         let port = listener.local_addr().expect("address").port();
         let sent: Arc<std::sync::Mutex<Vec<Sent>>> = Arc::default();
         let up = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let (keep, running) = (sent.clone(), up.clone());
+        let hold = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let held: Arc<std::sync::Mutex<Vec<tokio::sync::oneshot::Sender<bool>>>> = Arc::default();
+        let (keep, running, holding, waiting) = (sent.clone(), up.clone(), hold.clone(), held.clone());
         tokio::spawn(async move {
             while let Ok((socket, _)) = listener.accept().await {
-                let (keep, running) = (keep.clone(), running.clone());
+                let (keep, running, holding, waiting) = (keep.clone(), running.clone(), holding.clone(), waiting.clone());
                 tokio::spawn(async move {
                     let (read, mut write) = socket.into_split();
                     if !running.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1572,6 +1577,15 @@ impl FakeSmtp {
                                 }
                                 data.push(line.strip_prefix('.').map(str::to_owned).unwrap_or(line));
                             }
+                            if holding.load(std::sync::atomic::Ordering::SeqCst) {
+                                let (decide, decision) = tokio::sync::oneshot::channel();
+                                waiting.lock().unwrap().push(decide);
+                                if !decision.await.unwrap_or(false) {
+                                    let _ = write.write_all(b"554 refused\r\n").await;
+                                    recipients.clear();
+                                    continue;
+                                }
+                            }
                             keep.lock().unwrap().push(Sent { recipients: std::mem::take(&mut recipients), data: data.join("\r\n") });
                             b"250 queued\r\n"
                         } else if command == "QUIT" {
@@ -1587,7 +1601,7 @@ impl FakeSmtp {
                 });
             }
         });
-        Self { port, sent, up }
+        Self { port, sent, up, hold, held }
     }
 
     fn mailer(&self) -> Option<Arc<Mailer>> {
@@ -1600,6 +1614,22 @@ impl FakeSmtp {
 
     fn switch(&self, up: bool) {
         self.up.store(up, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// From now on, mails wait for `release` before they are answered.
+    fn hold(&self, hold: bool) {
+        self.hold.store(hold, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn held(&self) -> usize {
+        self.held.lock().unwrap().len()
+    }
+
+    /// Answers every mail held: taken, or refused.
+    fn release(&self, taken: bool) {
+        for decide in self.held.lock().unwrap().drain(..) {
+            let _ = decide.send(taken);
+        }
     }
 }
 
@@ -1782,4 +1812,32 @@ async fn a_text_that_looks_like_mail_headers_stays_in_the_body() {
     assert_eq!(sent[0].header("subject"), ["FlickerTalk suggestion (android 1.3.0)"]);
     assert!(sent[0].header("bcc").is_empty());
     assert_eq!(sent[0].text(), text.replace("\r\n", "\n"));
+}
+
+// The caps count "delivered plus in flight". Two delivered; A is in flight with the third slot;
+// B, arriving meanwhile, is refused; A then fails. The device has two delivered and one to go.
+#[tokio::test]
+async fn a_suggestion_refused_while_another_is_in_flight_leaves_no_trace() {
+    let (router, smtp, alice) = mailing_router().await;
+    for n in 0..2 {
+        assert_eq!(alice.suggest(&router, suggestion(&format!("idea {n}"), "1.3.0", "android")).await, 204);
+    }
+    smtp.hold(true);
+    let in_flight = {
+        let (base, http) = (router.base.clone(), router.http.clone());
+        let body = suggestion("A", "1.3.0", "android");
+        let mut request = http.post(format!("{base}/v1/feedback")).body(body.clone());
+        for (name, value) in alice.sign("POST", "/v1/feedback", &body, "in-flight") {
+            request = request.header(name, value);
+        }
+        tokio::spawn(async move { request.send().await.expect("answers").status().as_u16() })
+    };
+    assert!(soon(|| smtp.held() == 1).await, "A reached the mail server");
+    assert_eq!(alice.suggest(&router, suggestion("B", "1.3.0", "android")).await, 429);
+    smtp.release(false);
+    assert_eq!(in_flight.await.unwrap(), 503);
+    smtp.hold(false);
+    assert_eq!(alice.suggest(&router, suggestion("C", "1.3.0", "android")).await, 204, "two delivered, one to go");
+    assert_eq!(alice.suggest(&router, suggestion("D", "1.3.0", "android")).await, 429);
+    assert_eq!(smtp.sent().len(), 3);
 }

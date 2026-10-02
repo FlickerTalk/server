@@ -546,10 +546,10 @@ async fn feedback(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: Bytes) 
     let (subject, text) = suggestion.mail().ok_or(StatusCode::BAD_REQUEST)?;
     let mail = hub.mail.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let limiters = &hub.limiters;
-    if !limiters.feedback_device.allow(&device) {
+    if !limiters.feedback_device.take(&device) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
-    if !limiters.feedback_total.allow(ALL_SUGGESTIONS) {
+    if !limiters.feedback_total.take(ALL_SUGGESTIONS) {
         limiters.feedback_device.refund(&device);
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
