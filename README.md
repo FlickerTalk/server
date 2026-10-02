@@ -52,8 +52,9 @@ database or to a log. The mail carries the text, the version and the platform in
 no device ID, nor the phone's IP address or clock. While it handles the request the router sees
 which device sent it, as with any signed request, to check the signature and the limits: three
 suggestions per device and 200 in all every 24 hours, counting only those delivered. It answers
-`204` once the mail server has taken the mail, `400` for a malformed suggestion, `429` over a limit
-and `503` when mail is not set up or the mail server did not take it. The router always talks to
+`204` once the mail server has taken the mail, `400` for a malformed suggestion, `413` for a body
+over 32 KiB, `429` over a limit and `503` when mail is not set up or the mail server did not take
+it. The router always talks to
 the mail server over STARTTLS.
 
 No conversations, no contacts, no history, no access logs, no IP logs. There are no `/messages`,

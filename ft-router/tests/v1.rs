@@ -1841,3 +1841,24 @@ async fn a_suggestion_refused_while_another_is_in_flight_leaves_no_trace() {
     assert_eq!(alice.suggest(&router, suggestion("D", "1.3.0", "android")).await, 429);
     assert_eq!(smtp.sent().len(), 3);
 }
+
+// The body of a suggestion is bounded (32 KiB): beyond it, 413 before anything is parsed, no mail
+// and no quota spent. The bound still fits 2000 characters escaped the costliest way JSON allows.
+#[tokio::test]
+async fn a_suggestion_body_over_32_kib_is_refused_and_spends_nothing() {
+    let (router, smtp, alice) = mailing_router().await;
+    let oversized = suggestion(&"a".repeat(32 * 1024), "1.3.0", "android");
+    assert_eq!(alice.suggest(&router, oversized).await, 413);
+    assert!(smtp.sent().is_empty());
+
+    let text = "👋".repeat(2000);
+    let escaped: String = text.encode_utf16().map(|unit| format!("\\u{unit:04x}")).collect();
+    let body = format!(r#"{{"text":"{escaped}","app":"1.3.0","platform":"android"}}"#).into_bytes();
+    assert!(body.len() > 24_000 && body.len() <= 32 * 1024);
+    assert_eq!(alice.suggest(&router, body).await, 204);
+    assert_eq!(smtp.sent()[0].text(), text);
+    for _ in 0..2 {
+        assert_eq!(alice.suggest(&router, suggestion("more", "1.3.0", "android")).await, 204);
+    }
+    assert_eq!(alice.suggest(&router, suggestion("more", "1.3.0", "android")).await, 429, "the 413 cost nothing");
+}

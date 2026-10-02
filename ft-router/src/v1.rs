@@ -30,7 +30,8 @@
 //!   with nothing in the push (§12).
 //! - `POST /v1/feedback` (0.7.0): signed; a suggestion, mailed to the project's mailbox without
 //!   the device id and kept nowhere. Three per device and 200 in all per 24 h, counting only those
-//!   delivered; 503 when mail is not set up or the mail server did not take it.
+//!   delivered; 413 for a body over 32 KiB; 503 when mail is not set up or the mail server did not
+//!   take it.
 //!
 //! Requests are limited per device, per recipient and per origin (`limits.rs`, §91): 429 beyond.
 //!
@@ -45,7 +46,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
@@ -137,7 +138,7 @@ pub fn routes(hub: Arc<Hub>) -> Router {
         .route("/v1/mailbox", get(collect))
         .route("/v1/mailbox/{target}", post(deposit).delete(acknowledge))
         .route("/v1/turn-credentials", get(turn_credentials))
-        .route("/v1/feedback", post(feedback))
+        .route("/v1/feedback", post(feedback).layer(DefaultBodyLimit::max(MAX_SUGGESTION_BODY)))
         .with_state(hub)
 }
 
@@ -506,6 +507,9 @@ async fn turn_credentials(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Re
 const PLATFORMS: [&str; 5] = ["android", "ios", "macos", "windows", "linux"];
 /// Characters, not bytes, once the blanks around the text are gone.
 const MAX_SUGGESTION: usize = 2000;
+/// A suggestion's whole body: 2000 characters escaped the costliest way JSON allows (12 bytes for
+/// an emoji as two `\uXXXX`) fit; anything bigger is 413 before it is parsed.
+const MAX_SUGGESTION_BODY: usize = 32 * 1024;
 /// The key all suggestions share for the total cap.
 const ALL_SUGGESTIONS: &str = "all";
 
