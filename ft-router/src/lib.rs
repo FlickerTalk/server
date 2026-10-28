@@ -10,6 +10,7 @@
 //! temporary TURN user for that session only (§16–17).
 
 pub mod auth;
+pub mod bans;
 pub mod db;
 pub mod limits;
 pub mod mail;
@@ -61,6 +62,8 @@ pub struct Config {
     pub poc_relay: bool,
     /// Requests per device, recipient and origin (§91).
     pub limits: limits::Limits,
+    /// Devices cut off after an abuse report (0.8.0); none by default.
+    pub bans: Arc<bans::Bans>,
 }
 
 #[derive(Clone, Default)]
@@ -75,7 +78,15 @@ pub fn app(config: Config) -> Router {
         .db
         .clone()
         .map(|db| {
-            let hub = v1::Hub::new(db, config.stun.clone(), config.turn.clone(), config.push.clone(), config.mail.clone(), config.limits);
+            let hub = v1::Hub::new(
+                db,
+                config.stun.clone(),
+                config.turn.clone(),
+                config.push.clone(),
+                config.mail.clone(),
+                config.limits,
+                config.bans.clone(),
+            );
             v1::routes(Arc::new(hub))
         });
     let mut router = Router::new()

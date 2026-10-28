@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use ft_router::bans::{Bans, RELOAD_EVERY};
 use ft_router::db::Db;
 use ft_router::mail::{self, Mailer};
 use ft_router::push::{Apns, Fcm, PushVault, RingLimiter, ServiceAccount, Waker, WakeLimiter, APNS, FCM, RING_EVERY, RING_FOR, WAKE_EVERY};
@@ -126,6 +127,16 @@ fn mail_setup(
     Ok(Some(MailSetup { host, port, user, password, to }))
 }
 
+/// The devices cut off after an abuse report (0.8.0): the file named by `FT_BANNED_DEVICES_FILE`
+/// (a Swarm secret), read again every minute. Without the variable nobody is banned; a file that
+/// is not there or is malformed is an error, so the router does not start with a list it misread.
+fn bans_from(file: Option<String>) -> anyhow::Result<Bans> {
+    match file.filter(|file| !file.is_empty()) {
+        Some(file) => Bans::from_file(file, RELOAD_EVERY),
+        None => Ok(Bans::default()),
+    }
+}
+
 /// Expired mail is deleted every hour (§19).
 const PURGE_EVERY: Duration = Duration::from_secs(60 * 60);
 
@@ -134,6 +145,7 @@ async fn main() -> anyhow::Result<()> {
     let variable = |name: &str| std::env::var(name).ok();
     let secret = variable("FT_TURN_SECRET_FILE").map(std::fs::read).transpose()?;
     let mut config = config_from(variable("FT_STUN_URLS"), variable("FT_TURN_URLS"), secret);
+    config.bans = Arc::new(bans_from(variable("FT_BANNED_DEVICES_FILE"))?);
     let url_file = variable("FT_DATABASE_URL_FILE").map(std::fs::read).transpose()?;
     if let Some(url) = database_url(variable("FT_DATABASE_URL"), url_file) {
         let db = Arc::new(Db::connect(&url).await?);
@@ -275,6 +287,26 @@ mod tests {
         assert!(setup.mailer().is_ok());
         let wrong = mail_setup(some("h"), None, some("info"), password(), None).unwrap().expect("on");
         assert!(wrong.mailer().is_err(), "so is a user that is not an address");
+    }
+
+    // Banned devices (0.8.0): without the variable nobody is banned; a variable naming a file that
+    // is not there, or a malformed file, stops the router so that the mistake is seen at once.
+    #[test]
+    fn the_ban_list_is_empty_without_its_variable_and_a_wrong_file_stops_the_router() {
+        let banned = ft_router::auth::device_id(&[66; 32]);
+        assert!(!bans_from(None).unwrap().is_banned(&banned));
+        assert!(!bans_from(Some(String::new())).unwrap().is_banned(&banned), "an empty variable is no file");
+
+        let file = std::env::temp_dir().join(format!("ft-banned-{}", uuid::Uuid::now_v7()));
+        let path = file.to_str().unwrap().to_owned();
+        assert!(bans_from(Some(path.clone())).is_err(), "a file that is not there");
+        std::fs::write(&file, format!("# report\n{banned}\n")).unwrap();
+        let bans = bans_from(Some(path.clone())).unwrap();
+        assert!(bans.is_banned(&banned));
+        assert_eq!(bans.every(), Some(RELOAD_EVERY), "read again every minute");
+        std::fs::write(&file, "ft_typo\n").unwrap();
+        assert!(bans_from(Some(path)).is_err(), "a malformed one");
+        std::fs::remove_file(&file).unwrap();
     }
 
     #[test]

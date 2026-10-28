@@ -14,6 +14,7 @@ so it cannot read them. [flickertalk.com](https://flickertalk.com)
 | Undelivered messages, end-to-end encrypted, without sender, each with the number (0–7) of the routing code it came through | Deliver them later; hold back those for a session the user has left; give each routing code its own quota | Until picked up, at most 7 days |
 | Connection offers and answers for a phone that is not connected, end-to-end encrypted | Hand them over as soon as it connects | In memory only, never on disk: until it connects, at most 55 seconds |
 | How many suggestions each device has sent in the last 24 hours | Limit suggestions | In memory only, never on disk or in a log |
+| The device IDs banned after an abuse report, from a file the operator keeps, not in the database | Refuse them (see below) | Until the operator lifts the ban |
 
 A signal for a phone that is not connected is answered `404` with `ft-retained: 1`: the router
 wakes the phone and holds the signal in memory (eight per phone and 32 MiB in all, the oldest
@@ -56,6 +57,22 @@ suggestions per device and 200 in all every 24 hours, counting only those delive
 over 32 KiB, `429` over a limit and `503` when mail is not set up or the mail server did not take
 it. The router always talks to
 the mail server over STARTTLS.
+
+## Banned devices
+
+When a report shows a device being used for abuse, the operator can cut it off: its device ID goes
+in a file, one ID per line with `#` comments, named by `FT_BANNED_DEVICES_FILE` (a Swarm secret in
+production). The router reads the list at start, and stops with an error if the variable names a
+file that is not there or a line that is not a device ID; it reads it again every minute and keeps
+the last good list if the file breaks. Without the variable, nobody is banned.
+
+A banned device's signed requests are refused with `403`, registration included, and so is any
+signal or mail addressed to it, with the same `403` as for a routing code that leads nowhere: nobody
+can wake it or drop into its mailbox. At start, and whenever the list changes, the router deletes
+the banned devices' registrations and the mail waiting for them, drops the signals it holds for
+them and closes their connections. Taking an ID off the list lifts the ban. Mail and signals carry
+no sender, so the router cannot tell what a banned device sends; the people it writes to can block
+it in the app.
 
 No conversations, no contacts, no history, no access logs, no IP logs. There are no `/messages`,
 `/conversations`, `/users` or `/profiles` endpoints, and there never will be.
