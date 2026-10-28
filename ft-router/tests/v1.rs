@@ -8,6 +8,7 @@ use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
 use ft_router::auth::{device_id, SignedRequest};
+use ft_router::bans::Bans;
 use ft_router::db::Db;
 use ft_router::turn::TurnIssuer;
 use ft_router::push::{apns_target, PushVault, RingLimiter, Wake, WakeLimiter, Waker, APNS, FCM, RING_EVERY, RING_FOR};
@@ -50,9 +51,22 @@ async fn router_mailing(mail: Option<Arc<Mailer>>, limits: Limits) -> Router {
 }
 
 async fn router_built(push: Option<Arc<Push>>, mail: Option<Arc<Mailer>>, limits: Limits) -> Router {
+    router_on(fresh_db().await, push, mail, limits, Bans::default()).await
+}
+
+/// A database of its own: a fresh schema in the test database.
+async fn fresh_db() -> Arc<Db> {
     let url = std::env::var("FT_TEST_DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:test@127.0.0.1:55432/ft_router_test".to_owned());
-    let db = Arc::new(Db::connect_isolated(&url).await.expect("test database"));
+    Arc::new(Db::connect_isolated(&url).await.expect("test database"))
+}
+
+/// A router with a ban list, on `db`, which another router may share.
+async fn router_banning(db: Arc<Db>, bans: Bans, push: Option<Arc<Push>>) -> Router {
+    router_on(db, push, None, Limits::default(), bans).await
+}
+
+async fn router_on(db: Arc<Db>, push: Option<Arc<Push>>, mail: Option<Arc<Mailer>>, limits: Limits, bans: Bans) -> Router {
     let config = Config {
         stun: vec!["stun:turn.example:3478".to_owned()],
         turn: Some(TurnIssuer::new(b"secret".to_vec(), vec!["turn:turn.example:3478".to_owned()], Duration::from_secs(600))),
@@ -61,6 +75,7 @@ async fn router_built(push: Option<Arc<Push>>, mail: Option<Arc<Mailer>>, limits
         mail,
         poc_relay: false,
         limits,
+        bans: Arc::new(bans),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("binds");
     let address = listener.local_addr().expect("address");
@@ -213,13 +228,25 @@ impl Device {
     }
 
     async fn connect(&self, router: &Router) -> Socket {
+        let (socket, _) = connect_async(self.connect_url(router)).await.expect("connects");
+        socket
+    }
+
+    /// 101 when the socket opens, else the status the router answered.
+    async fn connect_status(&self, router: &Router) -> u16 {
+        match connect_async(self.connect_url(router)).await {
+            Ok(_) => 101,
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => response.status().as_u16(),
+            Err(other) => panic!("cannot reach the router: {other}"),
+        }
+    }
+
+    fn connect_url(&self, router: &Router) -> String {
         let path = "/v1/connect";
         // A fresh nonce each time, as the app does: a device reconnects.
         let headers = self.sign("GET", path, b"", &uuid::Uuid::now_v7().to_string());
         let query: Vec<String> = headers.iter().map(|(name, value)| format!("{name}={}", urlencode(value))).collect();
-        let url = format!("{}{path}?{}", router.base.replace("http", "ws"), query.join("&"));
-        let (socket, _) = connect_async(url).await.expect("connects");
-        socket
+        format!("{}{path}?{}", router.base.replace("http", "ws"), query.join("&"))
     }
 }
 
@@ -1861,4 +1888,145 @@ async fn a_suggestion_body_over_32_kib_is_refused_and_spends_nothing() {
         assert_eq!(alice.suggest(&router, suggestion("more", "1.3.0", "android")).await, 204);
     }
     assert_eq!(alice.suggest(&router, suggestion("more", "1.3.0", "android")).await, 429, "the 413 cost nothing");
+}
+
+// Banned devices (0.8.0, 2026-10-28; App Review Guideline 1.2): devices the operator has cut off
+// after an abuse report, listed in a file the router reads at start and again every minute.
+
+/// Waits a little for work the router does in the background, checked with the database.
+async fn eventually<F, Fut>(condition: F) -> bool
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..50 {
+        if condition().await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    condition().await
+}
+
+/// Whether the router has closed the socket, within a few seconds.
+async fn closed(socket: &mut Socket) -> bool {
+    loop {
+        match timeout(Duration::from_secs(3), socket.next()).await {
+            Err(_) => return false,
+            Ok(None | Some(Err(_)) | Some(Ok(Message::Close(_)))) => return true,
+            Ok(Some(Ok(_))) => continue,
+        }
+    }
+}
+
+/// A ban list file of its own, as the operator writes it.
+fn ban_file(text: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("ft-banned-{}", uuid::Uuid::now_v7()));
+    std::fs::write(&path, text).expect("writes");
+    path
+}
+
+impl Device {
+    /// Registers straight in the database, as if it had happened some other way.
+    async fn register_in(&self, db: &Db) {
+        db.register(&self.id(), &self.key.verifying_key().to_bytes(), blake3::hash(&self.capability).as_bytes(), 0)
+            .await
+            .expect("registers");
+    }
+}
+
+// A banned device cannot register, and nothing of it is kept; everyone else registers as before.
+#[tokio::test]
+async fn a_banned_device_cannot_register() {
+    let (alice, mallory) = (Device::new(1), Device::new(66));
+    let router = router_banning(fresh_db().await, Bans::listed([mallory.id()]), None).await;
+    assert_eq!(mallory.register(&router).await.status(), 403);
+    assert!(router.db.signing_key(&mallory.id()).await.unwrap().is_none(), "nothing of it is kept");
+    assert_eq!(alice.register(&router).await.status(), 204);
+}
+
+// A device banned while registered: once the router starts with the list, its registration and
+// the mail waiting for it are gone. Everyone else's stay.
+#[tokio::test]
+async fn a_banned_device_and_its_mail_are_deleted_when_the_router_starts() {
+    let before = router().await;
+    let (alice, mallory) = (Device::new(1), Device::new(66));
+    alice.register(&before).await;
+    mallory.register(&before).await;
+    assert_eq!(deposit(&before, &alice, alice.capability(), b"for alice".to_vec()).await.status(), 201);
+    assert_eq!(deposit(&before, &mallory, mallory.capability(), b"for mallory".to_vec()).await.status(), 201);
+
+    let after = router_banning(before.db.clone(), Bans::listed([mallory.id()]), None).await;
+    let db = after.db.clone();
+    assert!(eventually(|| async { db.signing_key(&mallory.id()).await.unwrap().is_none() }).await, "registration deleted");
+    assert!(db.collect(&mallory.id()).await.unwrap().is_empty(), "its mail too");
+    assert!(db.signing_key(&alice.id()).await.unwrap().is_some());
+    assert_eq!(blobs(&collected(&after, &alice).await), [b"for alice".as_slice()]);
+}
+
+// Should a banned device be registered all the same, it is refused as the caller of every signed
+// request, and as the target of signals and mail, which are neither delivered, held nor pushed:
+// nobody can wake it or drop into its mailbox.
+#[tokio::test]
+async fn a_banned_device_is_refused_as_caller_and_as_target() {
+    let waker = Arc::new(FakeWaker::default());
+    let mallory = Device::new(66);
+    let db = fresh_db().await;
+    mallory.register_in(&db).await;
+    let router = router_banning(db.clone(), Bans::listed([mallory.id()]), push_with(waker.clone())).await;
+    assert!(eventually(|| async { db.signing_key(&mallory.id()).await.unwrap().is_none() }).await);
+    mallory.register_in(&db).await;
+    let sealed = PushVault::new(&[9; 32]).seal("mallory-token");
+    assert!(db.set_push(&mallory.id(), FCM, &sealed).await.unwrap());
+
+    assert_eq!(mallory.connect_status(&router).await, 403);
+    assert_eq!(mallory.register(&router).await.status(), 403);
+    let push = serde_json::to_vec(&json!({ "provider": "fcm", "token": "other" })).unwrap();
+    let acknowledge = format!("/v1/mailbox/{}", uuid::Uuid::now_v7());
+    for (method, path, body) in [
+        ("GET", "/v1/mailbox", vec![]),
+        ("DELETE", acknowledge.as_str(), vec![]),
+        ("GET", "/v1/turn-credentials", vec![]),
+        ("PUT", "/v1/device/push", push),
+        ("DELETE", "/v1/device/push", vec![]),
+        ("DELETE", "/v1/device", vec![]),
+        ("POST", "/v1/feedback", suggestion("hello", "1.7.1", "ios")),
+    ] {
+        assert_eq!(mallory.request(&router, method, path, body).await.status(), 403, "{method} {path}");
+    }
+
+    assert_eq!(signal(&router, &mallory, mallory.capability(), b"offer".to_vec()).await.status(), 403);
+    assert_eq!(call(&router, &mallory, mallory.capability(), b"call".to_vec()).await.status(), 403);
+    assert_eq!(deposit(&router, &mallory, mallory.capability(), b"sealed".to_vec()).await.status(), 403);
+    assert!(db.collect(&mallory.id()).await.unwrap().is_empty(), "nothing dropped into its mailbox");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(waker.woken().is_empty() && waker.rung().is_empty(), "nobody woke or rang it");
+}
+
+// The list is read again: a device banned while connected is cut off at once, its registration
+// and mail are deleted, and taking it off the list lifts the ban.
+#[tokio::test]
+async fn a_device_banned_while_connected_is_cut_off_until_the_ban_is_lifted() {
+    let file = ban_file("# nobody yet\n");
+    let bans = Bans::from_file(&file, Duration::from_millis(50)).expect("reads");
+    let router = router_banning(fresh_db().await, bans, None).await;
+    let (alice, mallory) = (Device::new(1), Device::new(66));
+    assert_eq!(alice.register(&router).await.status(), 204);
+    assert_eq!(mallory.register(&router).await.status(), 204);
+    let mut socket = mallory.connect(&router).await;
+    assert_eq!(next_json(&mut socket).await["kind"], "welcome");
+    assert_eq!(deposit(&router, &mallory, mallory.capability(), b"sealed".to_vec()).await.status(), 201);
+
+    std::fs::write(&file, format!("# report of 2026-10-28\n{}\n", mallory.id())).unwrap();
+    assert!(closed(&mut socket).await, "its socket is closed");
+    let db = router.db.clone();
+    assert!(eventually(|| async { db.signing_key(&mallory.id()).await.unwrap().is_none() }).await);
+    assert!(db.collect(&mallory.id()).await.unwrap().is_empty());
+    assert_eq!(mallory.register(&router).await.status(), 403);
+    assert_eq!(signal(&router, &mallory, mallory.capability(), b"offer".to_vec()).await.status(), 403);
+    assert_eq!(alice.request(&router, "GET", "/v1/turn-credentials", vec![]).await.status(), 200, "alice goes on");
+
+    std::fs::write(&file, "").unwrap();
+    assert!(eventually(|| async { mallory.register(&router).await.status() == 204 }).await, "lifted");
+    std::fs::remove_file(&file).unwrap();
 }

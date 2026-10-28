@@ -35,6 +35,12 @@
 //!
 //! Requests are limited per device, per recipient and per origin (`limits.rs`, §91): 429 beyond.
 //!
+//! Banned devices (0.8.0, `bans.rs`; App Review Guideline 1.2): a validly signed request from a
+//! device on the ban list gets 403, registration included, and so does a signal or mail for it,
+//! the same answer as for a capability that leads nowhere. At start, and whenever the list read
+//! again has changed, the banned devices' registrations and the mail waiting for them are
+//! deleted, the signals held for them are dropped and their sockets are closed.
+//!
 //! Nothing is logged (§71). Connections and the signals waiting for a device live in memory only
 //! (never in the database, on disk or in a log), so signalling needs a single replica until it is
 //! shared between replicas (§106).
@@ -57,6 +63,7 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::auth::{self, decode_base64, ReplayGuard, SignedRequest, STANDARD_NO_PAD};
+use crate::bans::Bans;
 use crate::db::{Db, Route, MAX_BLOB};
 use crate::limits::{Limiters, Limits};
 use crate::mail::Mailer;
@@ -83,6 +90,7 @@ pub struct Hub {
     push: Option<Arc<Push>>,
     mail: Option<Arc<Mailer>>,
     limiters: Limiters,
+    bans: Arc<Bans>,
 }
 
 impl Hub {
@@ -93,6 +101,7 @@ impl Hub {
         push: Option<Arc<Push>>,
         mail: Option<Arc<Mailer>>,
         limits: Limits,
+        bans: Arc<Bans>,
     ) -> Self {
         Self {
             db,
@@ -104,6 +113,7 @@ impl Hub {
             push,
             mail,
             limiters: Limiters::new(limits),
+            bans,
         }
     }
 
@@ -128,6 +138,7 @@ impl Hub {
 pub fn routes(hub: Arc<Hub>) -> Router {
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
         runtime.spawn(sweep(Arc::downgrade(&hub)));
+        runtime.spawn(enforce_bans(Arc::downgrade(&hub)));
     }
     Router::new()
         .route("/v1/device/register", post(register))
@@ -150,6 +161,44 @@ async fn sweep(hub: Weak<Hub>) {
         let Some(hub) = hub.upgrade() else { return };
         hub.waiting.sweep(Instant::now());
     }
+}
+
+/// Cuts off the banned devices at start, then reads the list again every so often and cuts off
+/// those on it whenever it has changed, or when the last try failed. A list that cannot be read
+/// again keeps the one read last; the message names neither the file's contents nor a device.
+async fn enforce_bans(weak: Weak<Hub>) {
+    let mut pending = true;
+    loop {
+        let Some(hub) = weak.upgrade() else { return };
+        if pending {
+            pending = eject_banned(&hub).await.is_err();
+        }
+        let every = hub.bans.every().unwrap_or(crate::bans::RELOAD_EVERY);
+        drop(hub);
+        tokio::time::sleep(every).await;
+        let Some(hub) = weak.upgrade() else { return };
+        match hub.bans.reload() {
+            Ok(changed) => pending |= changed,
+            Err(error) => eprintln!("the ban list could not be read again, the last one read stays: {error:#}"),
+        }
+    }
+}
+
+/// Deletes the registration of every banned device and the mail waiting for it, drops the
+/// signals held for it and closes its socket (`serve` hears of every change of the list).
+async fn eject_banned(hub: &Hub) -> anyhow::Result<()> {
+    let mut result = Ok(());
+    for device in hub.bans.devices() {
+        {
+            let mut online = hub.online.lock().await;
+            online.remove(&device);
+            hub.waiting.take(&device, Instant::now());
+        }
+        if let Err(error) = hub.db.forget(&device).await {
+            result = Err(error);
+        }
+    }
+    result
 }
 
 fn now_ms() -> i64 {
@@ -201,6 +250,10 @@ async fn authenticate(
     };
     let request = SignedRequest { method, path, time_ms: signature.time_ms, nonce: &signature.nonce, body };
     auth::verify(&key, &request, &signature.signature).map_err(|_| StatusCode::UNAUTHORIZED)?;
+    // Only once the signature holds: nobody learns from an unsigned request that a device is banned.
+    if hub.bans.is_banned(&signature.device) {
+        return Err(StatusCode::FORBIDDEN);
+    }
     hub.guard
         .admit(&signature.device, &signature.nonce, signature.time_ms, now_ms())
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
@@ -211,7 +264,8 @@ async fn authenticate(
 }
 
 /// The recipient's route capability must come with anything addressed to it (§34). Returns which
-/// of its capabilities it was (app#9), and whether that slot is silent (2026-10-01).
+/// of its capabilities it was (app#9), and whether that slot is silent (2026-10-01). A banned
+/// recipient (0.8.0) has no route: the same 403, after the same lookup, as a wrong capability.
 async fn check_capability(hub: &Hub, to: &str, headers: &HeaderMap) -> Result<Route, StatusCode> {
     let capability = headers.get("ft-capability").and_then(|value| value.to_str().ok()).ok_or(StatusCode::FORBIDDEN)?;
     let capability: [u8; 32] = decode_base64(capability)
@@ -219,8 +273,8 @@ async fn check_capability(hub: &Hub, to: &str, headers: &HeaderMap) -> Result<Ro
         .and_then(|bytes| bytes.try_into().ok())
         .ok_or(StatusCode::FORBIDDEN)?;
     match hub.db.route(to, &capability).await {
-        Ok(Some(route)) => Ok(route),
-        Ok(None) => Err(StatusCode::FORBIDDEN),
+        Ok(Some(route)) if !hub.bans.is_banned(to) => Ok(route),
+        Ok(_) => Err(StatusCode::FORBIDDEN),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
@@ -358,6 +412,11 @@ async fn connect(
 }
 
 async fn serve(hub: Arc<Hub>, device: String, mut socket: WebSocket) {
+    // A device banned while connected (0.8.0) is cut off as soon as the list changes.
+    let mut bans = hub.bans.subscribe();
+    if hub.bans.is_banned(&device) {
+        return;
+    }
     let (outbox, mut pending) = mpsc::unbounded_channel::<String>();
     {
         // What came through a session the user has left since it was held is dropped, not handed
@@ -391,6 +450,7 @@ async fn serve(hub: Arc<Hub>, device: String, mut socket: WebSocket) {
             Some(text) = pending.recv() => alive = socket.send(Message::Text(text.into())).await.is_ok(),
             incoming = socket.recv() => alive = matches!(incoming, Some(Ok(message)) if !matches!(message, Message::Close(_))),
             _ = keepalive.tick() => alive = socket.send(Message::Ping(Bytes::new())).await.is_ok(),
+            Ok(()) = bans.changed() => alive = !hub.bans.is_banned(&device),
         }
     }
 
