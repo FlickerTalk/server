@@ -1,7 +1,9 @@
+use std::borrow::Cow;
 use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use sqlx::{AssertSqlSafe, Row};
 use uuid::Uuid;
@@ -9,6 +11,29 @@ use uuid::Uuid;
 pub const MAX_BLOB: usize = 64 * 1024;
 pub const MAX_BLOBS_MAIN_LIST: i64 = 1000;
 pub const MAX_BLOBS_PER_SESSION: i64 = 200;
+
+// sqlx also hashes comments; these are the checksums existing databases recorded for these files.
+const RECORDED_CHECKSUMS: [(i64, &str); 5] = [
+    (1, "327824ab11e36398fe285d83f71aabf82598fa5919fa986eeb5ddb697efdd183a7340fb951ab88ddfde645244e8cbd79"),
+    (2, "fa865ab6577314471029caa54f1164c8e67c01b8db3114b00769dcc7157d5899f924340f8b886bf3a7cac51a4c1349a9"),
+    (3, "9caa8ac05f4ffadb55fac9d964f37f16a9ead308da414a894c6c6d062f6ec5304052c623b0bc5bfeba21e0f74ce9ef17"),
+    (4, "b2d546e49f03d29c2863956f6ef1c8221a0727868f75257ed6ad206cb9a068e47752e96ff6387661d80c086e582ceaaa"),
+    (5, "8e7d24d24d3ad7579e8a6ae306f98a2cae0c25d8430daf3a3f54ecebc686978f5eb91a9b32da8a6a21b2a70711c434fa"),
+];
+
+fn migrator() -> Migrator {
+    let mut migrator = sqlx::migrate!("./migrations");
+    for migration in migrator.migrations.to_mut() {
+        if let Some((_, checksum)) = RECORDED_CHECKSUMS.iter().find(|(version, _)| *version == migration.version) {
+            migration.checksum = Cow::Owned(bytes(checksum));
+        }
+    }
+    migrator
+}
+
+fn bytes(hex: &str) -> Vec<u8> {
+    (0..hex.len()).step_by(2).map(|at| u8::from_str_radix(&hex[at..at + 2], 16).expect("a hex checksum")).collect()
+}
 
 pub struct Db {
     pool: PgPool,
@@ -31,7 +56,7 @@ impl Db {
     }
 
     async fn migrated(pool: PgPool) -> Result<Self> {
-        sqlx::migrate!("./migrations").run(&pool).await.context("cannot migrate the router database")?;
+        migrator().run(&pool).await.context("cannot migrate the router database")?;
         Ok(Self { pool })
     }
 
@@ -244,10 +269,47 @@ mod tests {
 
     use super::*;
 
+    fn url() -> String {
+        std::env::var("FT_TEST_DATABASE_URL").unwrap_or_else(|_| "postgres://postgres:test@127.0.0.1:55432/ft_router_test".to_owned())
+    }
+
     async fn db() -> Db {
-        let url = std::env::var("FT_TEST_DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://postgres:test@127.0.0.1:55432/ft_router_test".to_owned());
-        Db::connect_isolated(&url).await.expect("connects to the test database")
+        Db::connect_isolated(&url()).await.expect("connects to the test database")
+    }
+
+    const PRODUCTION_CHECKSUMS: [(i64, &str); 5] = [
+        (1, "327824ab11e36398fe285d83f71aabf82598fa5919fa986eeb5ddb697efdd183a7340fb951ab88ddfde645244e8cbd79"),
+        (2, "fa865ab6577314471029caa54f1164c8e67c01b8db3114b00769dcc7157d5899f924340f8b886bf3a7cac51a4c1349a9"),
+        (3, "9caa8ac05f4ffadb55fac9d964f37f16a9ead308da414a894c6c6d062f6ec5304052c623b0bc5bfeba21e0f74ce9ef17"),
+        (4, "b2d546e49f03d29c2863956f6ef1c8221a0727868f75257ed6ad206cb9a068e47752e96ff6387661d80c086e582ceaaa"),
+        (5, "8e7d24d24d3ad7579e8a6ae306f98a2cae0c25d8430daf3a3f54ecebc686978f5eb91a9b32da8a6a21b2a70711c434fa"),
+    ];
+
+    #[tokio::test]
+    async fn a_database_holding_the_production_checksums_still_migrates() {
+        let pool = isolated_pool(&url()).await.expect("a fresh schema");
+        Db::migrated(pool.clone()).await.expect("migrates");
+        for (version, checksum) in PRODUCTION_CHECKSUMS {
+            let updated = sqlx::query("UPDATE _sqlx_migrations SET checksum = decode($2, 'hex') WHERE version = $1")
+                .bind(version)
+                .bind(checksum)
+                .execute(&pool)
+                .await
+                .expect("records the checksum production holds");
+            assert_eq!(updated.rows_affected(), 1);
+        }
+        Db::migrated(pool).await.expect("a database migrated by an earlier router still migrates");
+    }
+
+    #[tokio::test]
+    async fn a_fresh_database_records_the_production_checksums() {
+        let pool = isolated_pool(&url()).await.expect("a fresh schema");
+        Db::migrated(pool.clone()).await.expect("migrates");
+        let recorded: Vec<(i64, String)> = sqlx::query_as("SELECT version, encode(checksum, 'hex') FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(&pool)
+            .await
+            .expect("reads the recorded migrations");
+        assert_eq!(recorded, PRODUCTION_CHECKSUMS.map(|(version, checksum)| (version, checksum.to_owned())));
     }
 
     const KEY: [u8; 32] = [1; 32];
@@ -374,10 +436,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_silent_slots_migration_applies_to_an_existing_database() {
-        let url = std::env::var("FT_TEST_DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://postgres:test@127.0.0.1:55432/ft_router_test".to_owned());
-        let pool = isolated_pool(&url).await.expect("a fresh schema");
-        sqlx::migrate!("./migrations").run_to(3, &pool).await.expect("migrates up to 0003");
+        let pool = isolated_pool(&url()).await.expect("a fresh schema");
+        migrator().run_to(3, &pool).await.expect("migrates up to 0003");
         sqlx::query("INSERT INTO devices (device_id, signing_key, capability_hash, push_provider, push_target) VALUES ('ft_old', $1, $2, 'fcm', $3)")
             .bind(KEY.as_slice())
             .bind(capability_hash().as_slice())
@@ -515,10 +575,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_mailbox_slot_migration_applies_to_a_database_from_0_5_1() {
-        let url = std::env::var("FT_TEST_DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://postgres:test@127.0.0.1:55432/ft_router_test".to_owned());
-        let pool = isolated_pool(&url).await.expect("a fresh schema");
-        sqlx::migrate!("./migrations").run_to(4, &pool).await.expect("migrates up to 0004");
+        let pool = isolated_pool(&url()).await.expect("a fresh schema");
+        migrator().run_to(4, &pool).await.expect("migrates up to 0004");
         sqlx::query("INSERT INTO devices (device_id, signing_key, capability_hash, silent_slots) VALUES ('ft_old', $1, $2, 254)")
             .bind(KEY.as_slice())
             .bind(capability_hash().as_slice())
