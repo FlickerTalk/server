@@ -86,6 +86,13 @@ cargo test --workspace
 docker build -t ft-router .
 ```
 
+The expected TURN password in `ft-router/src/turn.rs` comes from openssl, not from the router's
+code. To compute it again:
+
+```sh
+printf %s "1700000600:4f1c" | openssl dgst -sha1 -hmac "shared-secret" -binary | base64
+```
+
 The image is published to `ghcr.io/flickertalk/ft-router` by GitHub Actions: `canary` on every push
 to `main`, and the version plus `latest` on every `vX.Y.Z` tag.
 
