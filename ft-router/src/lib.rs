@@ -1,0 +1,159 @@
+pub mod auth;
+pub mod bans;
+pub mod db;
+pub mod limits;
+pub mod mail;
+pub mod turn;
+pub mod waiting;
+pub mod push;
+
+pub use push::Push;
+pub mod v1;
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::SystemTime;
+
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Path, State};
+use axum::response::Response;
+use axum::routing::get;
+use axum::Router;
+use futures_util::{SinkExt, StreamExt};
+use tokio::sync::{mpsc, Mutex};
+
+use crate::db::Db;
+use crate::turn::TurnIssuer;
+
+pub const PEER_PRESENT: &str = r#"{"kind":"peer_present"}"#;
+pub const PEER_JOINED: &str = r#"{"kind":"peer_joined"}"#;
+pub const PEER_LEFT: &str = r#"{"kind":"peer_left"}"#;
+
+type Outbox = mpsc::UnboundedSender<String>;
+
+#[derive(Clone, Default)]
+pub struct Config {
+    pub stun: Vec<String>,
+    pub turn: Option<TurnIssuer>,
+    pub db: Option<Arc<Db>>,
+    pub push: Option<Arc<Push>>,
+    pub mail: Option<Arc<mail::Mailer>>,
+    /// Off by default because it's an open relay (FT_POC_RELAY=1 turns it on).
+    pub poc_relay: bool,
+    pub limits: limits::Limits,
+    pub bans: Arc<bans::Bans>,
+}
+
+#[derive(Clone, Default)]
+struct Rooms {
+    peers: Arc<Mutex<HashMap<String, HashMap<u64, Outbox>>>>,
+    next_id: Arc<AtomicU64>,
+    config: Arc<Config>,
+}
+
+pub fn app(config: Config) -> Router {
+    let v1 = config
+        .db
+        .clone()
+        .map(|db| {
+            let hub = v1::Hub::new(
+                db,
+                config.stun.clone(),
+                config.turn.clone(),
+                config.push.clone(),
+                config.mail.clone(),
+                config.limits,
+                config.bans.clone(),
+            );
+            v1::routes(Arc::new(hub))
+        });
+    let mut router = Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .route("/version", get(|| async { env!("CARGO_PKG_VERSION") }));
+    if config.poc_relay {
+        router = router.route("/poc/rooms/{room}", get(join));
+    }
+    let router = router.with_state(Rooms { config: Arc::new(config), ..Rooms::default() });
+    match v1 {
+        Some(v1) => router.merge(v1),
+        None => router,
+    }
+}
+
+async fn join(socket: WebSocketUpgrade, Path(room): Path<String>, State(rooms): State<Rooms>) -> Response {
+    socket.on_upgrade(move |socket| relay(socket, room, rooms))
+}
+
+fn welcome(config: &Config) -> String {
+    let turn = config.turn.as_ref().map(|issuer| issuer.issue(SystemTime::now()));
+    serde_json::json!({ "kind": "welcome", "stun": config.stun, "turn": turn }).to_string()
+}
+
+async fn relay(socket: WebSocket, room: String, rooms: Rooms) {
+    let id = rooms.next_id.fetch_add(1, Ordering::Relaxed);
+    let (outbox, mut pending) = mpsc::unbounded_channel::<String>();
+    let _ = outbox.send(welcome(&rooms.config));
+
+    {
+        let mut all = rooms.peers.lock().await;
+        let peers = all.entry(room.clone()).or_default();
+        if !peers.is_empty() {
+            let _ = outbox.send(PEER_PRESENT.to_owned());
+            broadcast(peers, id, PEER_JOINED);
+        }
+        peers.insert(id, outbox);
+    }
+
+    let (mut sink, mut stream) = socket.split();
+    let writer = tokio::spawn(async move {
+        while let Some(text) = pending.recv().await {
+            if sink.send(Message::Text(text.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    while let Some(Ok(message)) = stream.next().await {
+        if let Message::Text(text) = message {
+            if let Some(peers) = rooms.peers.lock().await.get(&room) {
+                broadcast(peers, id, text.as_str());
+            }
+        }
+    }
+
+    let mut all = rooms.peers.lock().await;
+    if let Some(peers) = all.get_mut(&room) {
+        peers.remove(&id);
+        broadcast(peers, id, PEER_LEFT);
+        if peers.is_empty() {
+            all.remove(&room);
+        }
+    }
+    writer.abort();
+}
+
+fn broadcast(peers: &HashMap<u64, Outbox>, from: u64, text: &str) {
+    for (id, outbox) in peers {
+        if *id != from {
+            let _ = outbox.send(text.to_owned());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_broadcast_skips_the_sender() {
+        let (to_sender, mut sender_inbox) = mpsc::unbounded_channel();
+        let (to_other, mut other_inbox) = mpsc::unbounded_channel();
+        let peers = HashMap::from([(1, to_sender), (2, to_other)]);
+
+        broadcast(&peers, 1, "hi");
+
+        assert_eq!(other_inbox.try_recv().ok().as_deref(), Some("hi"));
+        assert!(sender_inbox.try_recv().is_err());
+    }
+}
