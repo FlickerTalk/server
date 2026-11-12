@@ -1,6 +1,5 @@
--- Hidden sessions, phase 2 (app#9): a device may hand out eight route capabilities, always
--- eight, most of them unused, so the router cannot tell how many hidden sessions a phone has.
--- `devices.capability_hash` stays the first (slot 0) for apps from before.
+-- Always eight per device, most unused, so the router cannot count a phone's hidden sessions.
+-- `devices.capability_hash` stays slot 0 for older apps.
 CREATE TABLE capabilities (
     device_id       TEXT     NOT NULL REFERENCES devices (device_id) ON DELETE CASCADE,
     slot            SMALLINT NOT NULL CHECK (slot BETWEEN 0 AND 7),

@@ -1,4 +1,2 @@
--- Silent slots (2026-10-01): which of the device's eight capabilities are sessions the user has
--- left, as a bitmask (bit i = slot i). The router sends no push for them. Opaque bits, replaced by
--- every registration; devices from before have none.
+-- Bit i set: the user has left the session on slot i, and the router sends no push for it.
 ALTER TABLE devices ADD COLUMN silent_slots SMALLINT NOT NULL DEFAULT 0 CHECK (silent_slots BETWEEN 0 AND 255);
