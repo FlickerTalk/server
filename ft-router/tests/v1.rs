@@ -4,9 +4,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
-use ft_router::auth::{device_id, SignedRequest};
+use ft_router::auth::{caller_tag, device_id, SignedRequest};
 use ft_router::bans::Bans;
-use ft_router::db::Db;
+use ft_router::db::{CallRule, Db};
 use ft_router::turn::TurnIssuer;
 use ft_router::push::{apns_target, PushVault, RingLimiter, Wake, WakeLimiter, Waker, APNS, FCM, RING_EVERY, RING_FOR};
 use ft_router::limits::{FeedbackLimits, Limits};
@@ -1852,4 +1852,269 @@ async fn a_device_banned_while_connected_is_cut_off_until_the_ban_is_lifted() {
     std::fs::write(&file, "").unwrap();
     assert!(eventually(|| async { mallory.register(&router).await.status() == 204 }).await, "lifted");
     std::fs::remove_file(&file).unwrap();
+}
+
+impl Device {
+    async fn register_with_call_rules(&self, router: &Router, call_rules: Value) -> reqwest::Response {
+        let body = json!({
+            "signing_key": STANDARD_NO_PAD.encode(self.key.verifying_key().to_bytes()),
+            "capability_hash": STANDARD_NO_PAD.encode(blake3::hash(&self.capability).as_bytes()),
+            "call_rules": call_rules,
+        });
+        self.request(router, "POST", "/v1/device/register", serde_json::to_vec(&body).unwrap()).await
+    }
+
+    async fn call_signed(&self, router: &Router, to: &Device, headers: Vec<(&'static str, String)>) -> reqwest::Response {
+        let mut request = router
+            .http
+            .post(format!("{}/v1/signal/{}", router.base, to.id()))
+            .header("ft-capability", to.capability())
+            .header("ft-call", "1")
+            .body(b"call offer".to_vec());
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        request.send().await.expect("answers")
+    }
+
+    fn signed_call_headers(&self, to: &Device) -> Vec<(&'static str, String)> {
+        self.sign("POST", &format!("/v1/signal/{}", to.id()), b"call offer", &uuid::Uuid::now_v7().to_string())
+    }
+
+    async fn call(&self, router: &Router, to: &Device) -> reqwest::Response {
+        self.call_signed(router, to, self.signed_call_headers(to)).await
+    }
+
+    fn tag_for(&self, caller: &Device) -> [u8; 32] {
+        caller_tag(&self.capability, &caller.id())
+    }
+}
+
+fn call_rule(callee: &Device, caller: &Device, rule: &str) -> Value {
+    json!({ "caller": STANDARD_NO_PAD.encode(callee.tag_for(caller)), "rule": rule })
+}
+
+async fn callee_with_rules(router: &Router, rules: impl Fn(&Device) -> Value) -> Device {
+    let bob = Device::new(2);
+    assert_eq!(bob.register_with_call_rules(router, rules(&bob)).await.status(), 204);
+    assert_eq!(bob.set_push(router, "bob-token").await.status(), 204);
+    bob
+}
+
+#[tokio::test]
+async fn a_signed_call_from_a_quiet_caller_wakes_without_ringing() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_with(waker.clone())).await;
+    let alice = Device::new(1);
+    alice.register(&router).await;
+    let bob = callee_with_rules(&router, |bob| json!([call_rule(bob, &alice, "quiet")])).await;
+
+    assert_eq!(alice.call(&router, &bob).await.status(), 404);
+    assert!(soon(|| waker.woken() == ["bob-token"]).await);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(waker.rung().is_empty());
+}
+
+#[tokio::test]
+async fn a_signed_call_from_a_blocked_caller_sends_no_push_but_still_waits_for_the_phone() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_with(waker.clone())).await;
+    let alice = Device::new(1);
+    alice.register(&router).await;
+    let bob = callee_with_rules(&router, |bob| json!([call_rule(bob, &alice, "none")])).await;
+
+    assert_eq!(alice.call(&router, &bob).await.status(), 404);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(waker.woken().is_empty() && waker.rung().is_empty());
+
+    let mut socket = bob.connect(&router).await;
+    assert_eq!(next_json(&mut socket).await["kind"], "welcome");
+    assert_eq!(next_signal(&mut socket).await, b"call offer");
+}
+
+#[tokio::test]
+async fn a_signed_call_from_an_unlisted_caller_rings() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_with(waker.clone())).await;
+    let (alice, carol) = (Device::new(1), Device::new(3));
+    alice.register(&router).await;
+    carol.register(&router).await;
+    let bob = callee_with_rules(&router, |bob| json!([call_rule(bob, &carol, "none")])).await;
+
+    assert_eq!(alice.call(&router, &bob).await.status(), 404);
+    assert!(soon(|| waker.rung() == ["bob-token"]).await);
+    assert!(waker.woken().is_empty());
+}
+
+#[tokio::test]
+async fn an_unsigned_call_rings_as_before_whatever_the_rules() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_with(waker.clone())).await;
+    let alice = Device::new(1);
+    alice.register(&router).await;
+    let bob = callee_with_rules(&router, |bob| json!([call_rule(bob, &alice, "none")])).await;
+
+    assert_eq!(call(&router, &bob, bob.capability(), b"call offer".to_vec()).await.status(), 404);
+    assert!(soon(|| waker.rung() == ["bob-token"]).await);
+}
+
+#[tokio::test]
+async fn a_call_with_a_bad_signature_is_refused_and_sends_no_push() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_paced(waker.clone(), Arc::default(), Duration::ZERO)).await;
+    let (alice, mallory, stranger) = (Device::new(1), Device::new(66), Device::new(7));
+    alice.register(&router).await;
+    mallory.register(&router).await;
+    let bob = callee_with_rules(&router, |_| json!([])).await;
+
+    let over_another_body = alice.sign("POST", &format!("/v1/signal/{}", bob.id()), b"another offer", "n1");
+    let posing_as_alice: Vec<_> = mallory
+        .signed_call_headers(&bob)
+        .into_iter()
+        .map(|(name, value)| (name, if name == "ft-device" { alice.id() } else { value }))
+        .collect();
+    let half_signed = vec![("ft-device", alice.id())];
+    let replayed = alice.signed_call_headers(&bob);
+    assert_eq!(alice.call_signed(&router, &bob, replayed.clone()).await.status(), 404);
+    assert!(soon(|| waker.rung().len() == 1).await);
+    let mut socket = bob.connect(&router).await;
+    assert_eq!(next_json(&mut socket).await["kind"], "welcome");
+    assert_eq!(next_signal(&mut socket).await, b"call offer");
+    drop(socket);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    for headers in [over_another_body, posing_as_alice, stranger.signed_call_headers(&bob), half_signed, replayed] {
+        let answer = alice.call_signed(&router, &bob, headers).await;
+        assert_eq!(answer.status(), 401);
+        assert!(!answer.headers().contains_key("ft-retained"));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!((waker.woken().len(), waker.rung().len()), (0, 1), "only the first call rang");
+
+    let mut socket = bob.connect(&router).await;
+    assert_eq!(next_json(&mut socket).await["kind"], "welcome");
+    assert!(nothing_more(&mut socket).await, "no refused call was held");
+}
+
+#[tokio::test]
+async fn a_signed_call_gets_the_same_answer_whatever_the_rule() {
+    let router = router_with(push_with(Arc::default())).await;
+    let (alice, carol, dave) = (Device::new(1), Device::new(3), Device::new(4));
+    for caller in [&alice, &carol, &dave] {
+        caller.register(&router).await;
+    }
+    let bob = callee_with_rules(&router, |bob| json!([call_rule(bob, &alice, "quiet"), call_rule(bob, &carol, "none")])).await;
+
+    let quiet = seen(alice.call(&router, &bob).await).await;
+    let no_push = seen(carol.call(&router, &bob).await).await;
+    let unlisted = seen(dave.call(&router, &bob).await).await;
+
+    assert_eq!(quiet, unlisted);
+    assert_eq!(no_push, unlisted);
+    assert_eq!(unlisted.0, 404);
+    assert_eq!(unlisted.1.get("ft-retained").map(String::as_str), Some("1"));
+}
+
+#[tokio::test]
+async fn a_signed_call_reaches_a_connected_phone_whatever_the_rule() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_with(waker.clone())).await;
+    let alice = Device::new(1);
+    alice.register(&router).await;
+    let bob = callee_with_rules(&router, |bob| json!([call_rule(bob, &alice, "none")])).await;
+    let mut socket = bob.connect(&router).await;
+    assert_eq!(next_json(&mut socket).await["kind"], "welcome");
+
+    assert_eq!(alice.call(&router, &bob).await.status(), 202);
+    assert_eq!(next_signal(&mut socket).await, b"call offer");
+}
+
+#[tokio::test]
+async fn signature_headers_on_a_signal_that_is_not_a_call_are_ignored() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_with(waker.clone())).await;
+    let alice = Device::new(1);
+    alice.register(&router).await;
+    let bob = callee_with_rules(&router, |bob| json!([call_rule(bob, &alice, "none")])).await;
+
+    let path = format!("/v1/signal/{}", bob.id());
+    for headers in [alice.sign("POST", &path, b"offer", "n1"), Device::new(7).sign("POST", &path, b"other", "n2")] {
+        let mut request = router.http.post(format!("{}{path}", router.base)).header("ft-capability", bob.capability()).body(b"offer".to_vec());
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        let answer = request.send().await.expect("answers");
+        assert_eq!(answer.status(), 404);
+        assert_eq!(answer.headers().get("ft-retained").map(|value| value.to_str().unwrap()), Some("1"));
+    }
+    assert!(soon(|| waker.woken() == ["bob-token"]).await, "rules are for calls only");
+}
+
+#[tokio::test]
+async fn a_registration_without_call_rules_keeps_them_and_an_empty_list_clears_them() {
+    let router = router().await;
+    let (alice, bob) = (Device::new(1), Device::new(2));
+    assert_eq!(bob.register_with_call_rules(&router, json!([call_rule(&bob, &alice, "quiet")])).await.status(), 204);
+    assert_eq!(router.db.call_rule(&bob.id(), &bob.tag_for(&alice)).await.unwrap(), Some(CallRule::Quiet));
+
+    assert_eq!(bob.register(&router).await.status(), 204);
+    assert_eq!(router.db.call_rule(&bob.id(), &bob.tag_for(&alice)).await.unwrap(), Some(CallRule::Quiet), "kept");
+
+    assert_eq!(bob.register_with_call_rules(&router, json!([call_rule(&bob, &alice, "none")])).await.status(), 204);
+    assert_eq!(router.db.call_rule(&bob.id(), &bob.tag_for(&alice)).await.unwrap(), Some(CallRule::NoPush), "replaced");
+
+    assert_eq!(bob.register_with_call_rules(&router, json!([])).await.status(), 204);
+    assert_eq!(router.db.call_rule(&bob.id(), &bob.tag_for(&alice)).await.unwrap(), None, "cleared");
+}
+
+fn many_call_rules(count: u32) -> Value {
+    let rules: Vec<Value> = (0..count)
+        .map(|n| json!({ "caller": STANDARD_NO_PAD.encode(blake3::hash(&n.to_le_bytes()).as_bytes()), "rule": "quiet" }))
+        .collect();
+    json!(rules)
+}
+
+#[tokio::test]
+async fn malformed_call_rules_are_refused() {
+    let router = router().await;
+    let (alice, bob) = (Device::new(1), Device::new(2));
+    let tag = STANDARD_NO_PAD.encode(bob.tag_for(&alice));
+    for wrong in [
+        many_call_rules(1025),
+        json!([{ "caller": STANDARD_NO_PAD.encode([1u8; 31]), "rule": "quiet" }]),
+        json!([{ "caller": STANDARD_NO_PAD.encode([1u8; 33]), "rule": "quiet" }]),
+        json!([{ "caller": "not base64!", "rule": "quiet" }]),
+        json!([{ "caller": tag, "rule": "loud" }]),
+        json!([{ "caller": tag, "rule": "Quiet" }]),
+        json!([{ "caller": tag, "rule": 1 }]),
+        json!([{ "caller": tag }]),
+        json!([{ "rule": "quiet" }]),
+        json!({ "caller": tag, "rule": "quiet" }),
+        json!("quiet"),
+    ] {
+        assert_eq!(bob.register_with_call_rules(&router, wrong.clone()).await.status(), 400, "{wrong}");
+    }
+    assert!(router.db.signing_key(&bob.id()).await.unwrap().is_none(), "never registered");
+
+    assert_eq!(bob.register_with_call_rules(&router, many_call_rules(1024)).await.status(), 204);
+    assert_eq!(bob.register_with_call_rules(&router, json!([call_rule(&bob, &alice, "quiet")])).await.status(), 204);
+    assert_eq!(bob.register_with_call_rules(&router, json!([{ "caller": tag, "rule": "loud" }])).await.status(), 400);
+    assert_eq!(router.db.call_rule(&bob.id(), &bob.tag_for(&alice)).await.unwrap(), Some(CallRule::Quiet), "a refused list changes nothing");
+}
+
+#[tokio::test]
+async fn a_muted_or_blocked_caller_does_not_hold_back_the_next_ring() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_with(waker.clone())).await;
+    let (alice, carol, dave) = (Device::new(1), Device::new(3), Device::new(4));
+    for caller in [&alice, &carol, &dave] {
+        caller.register(&router).await;
+    }
+    let bob = callee_with_rules(&router, |bob| json!([call_rule(bob, &alice, "quiet"), call_rule(bob, &carol, "none")])).await;
+
+    carol.call(&router, &bob).await;
+    alice.call(&router, &bob).await;
+    assert!(soon(|| waker.woken() == ["bob-token"]).await);
+    dave.call(&router, &bob).await;
+    assert!(soon(|| waker.rung() == ["bob-token"]).await);
 }

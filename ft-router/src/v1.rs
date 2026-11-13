@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::auth::{self, decode_base64, ReplayGuard, SignedRequest, STANDARD_NO_PAD};
 use crate::bans::Bans;
-use crate::db::{Db, Route, MAX_BLOB};
+use crate::db::{CallRule, Db, Route, MAX_BLOB};
 use crate::limits::{Limiters, Limits};
 use crate::mail::Mailer;
 use crate::push::{silent, Push, Wake, MAX_TOKEN};
@@ -170,6 +170,10 @@ impl Signature {
     fn from_headers(headers: &HeaderMap) -> Option<Self> {
         Self::from_pairs(|name| headers.get(name)?.to_str().ok().map(str::to_owned))
     }
+
+    fn present(headers: &HeaderMap) -> bool {
+        ["ft-device", "ft-time", "ft-nonce", "ft-signature"].into_iter().any(|name| headers.contains_key(name))
+    }
 }
 
 async fn authenticate(
@@ -207,14 +211,14 @@ async fn authenticate(
 }
 
 /// A banned recipient gets the same 403, after the same lookup, as a wrong capability.
-async fn check_capability(hub: &Hub, to: &str, headers: &HeaderMap) -> Result<Route, StatusCode> {
+async fn check_capability(hub: &Hub, to: &str, headers: &HeaderMap) -> Result<(Route, [u8; 32]), StatusCode> {
     let capability = headers.get("ft-capability").and_then(|value| value.to_str().ok()).ok_or(StatusCode::FORBIDDEN)?;
     let capability: [u8; 32] = decode_base64(capability)
         .ok()
         .and_then(|bytes| bytes.try_into().ok())
         .ok_or(StatusCode::FORBIDDEN)?;
     match hub.db.route(to, &capability).await {
-        Ok(Some(route)) if !hub.bans.is_banned(to) => Ok(route),
+        Ok(Some(route)) if !hub.bans.is_banned(to) => Ok((route, capability)),
         Ok(_) => Err(StatusCode::FORBIDDEN),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
@@ -232,6 +236,33 @@ struct Registration {
     capability_hashes: Option<Vec<String>>,
     #[serde(default)]
     silent_slots: u8,
+    #[serde(default)]
+    call_rules: Option<Vec<ListedCallRule>>,
+}
+
+const MAX_CALL_RULES: usize = 1024;
+
+#[derive(Deserialize)]
+struct ListedCallRule {
+    caller: String,
+    rule: String,
+}
+
+fn call_rules(listed: &[ListedCallRule]) -> Result<Vec<([u8; 32], CallRule)>, StatusCode> {
+    if listed.len() > MAX_CALL_RULES {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    listed
+        .iter()
+        .map(|entry| {
+            let rule = match entry.rule.as_str() {
+                "quiet" => CallRule::Quiet,
+                "none" => CallRule::NoPush,
+                _ => return Err(StatusCode::BAD_REQUEST),
+            };
+            Ok((key32(&entry.caller)?, rule))
+        })
+        .collect()
 }
 
 async fn register(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: Bytes) -> Result<StatusCode, StatusCode> {
@@ -247,6 +278,7 @@ async fn register(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: Bytes) 
         Some(_) => return Err(StatusCode::BAD_REQUEST),
         None => None,
     };
+    let call_rules = registration.call_rules.as_deref().map(call_rules).transpose()?;
     let device =
         authenticate(&hub, "POST", "/v1/device/register", Signature::from_headers(&headers), &body, Some(key)).await?;
     // bit 0 is the main list, which always rings
@@ -254,6 +286,9 @@ async fn register(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: Bytes) 
     let before = hub.db.register(&device, &key, &hash, silent_slots).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if let Some(eight) = eight {
         hub.db.set_capabilities(&device, &eight).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+    if let Some(call_rules) = call_rules {
+        hub.db.set_call_rules(&device, &call_rules).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     }
     let opened = before & !silent_slots;
     if opened != 0 && matches!(hub.db.mail_through(&device, opened).await, Ok(true)) {
@@ -322,6 +357,21 @@ fn wake_as(hub: &Arc<Hub>, device: &str, slot: u8, call: bool) {
         let woke = if call { waker.ring(&token, slot).await } else { waker.wake(&token, slot).await };
         if woke == Wake::Unregistered {
             let _ = hub.db.clear_push(&device).await;
+        }
+    });
+}
+
+/// The rule is looked up in the background, so the caller gets the same answer and timing whatever it is.
+fn ring_as_ruled(hub: &Arc<Hub>, device: &str, slot: u8, caller: [u8; 32]) {
+    if hub.push.is_none() {
+        return;
+    }
+    let (hub, device) = (hub.clone(), device.to_owned());
+    tokio::spawn(async move {
+        match hub.db.call_rule(&device, &caller).await {
+            Ok(None) => wake_as(&hub, &device, slot, true),
+            Ok(Some(CallRule::Quiet)) => wake_as(&hub, &device, slot, false),
+            Ok(Some(CallRule::NoPush)) | Err(_) => {}
         }
     });
 }
@@ -397,9 +447,19 @@ async fn signal(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: He
     if let Err(status) = hub.limit_origin(&headers) {
         return status.into_response();
     }
-    let route = match check_capability(&hub, &to, &headers).await {
-        Ok(route) => route,
+    let (route, capability) = match check_capability(&hub, &to, &headers).await {
+        Ok(checked) => checked,
         Err(status) => return status.into_response(),
+    };
+    let call = headers.get("ft-call").is_some_and(|value| value == "1");
+    let caller = if call && Signature::present(&headers) {
+        let path = format!("/v1/signal/{to}");
+        match authenticate(&hub, "POST", &path, Signature::from_headers(&headers), &body, None).await {
+            Ok(caller) => Some(caller),
+            Err(status) => return status.into_response(),
+        }
+    } else {
+        None
     };
     if let Err(status) = hub.limit_recipient(&to) {
         return status.into_response();
@@ -415,9 +475,11 @@ async fn signal(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: He
         }
         hub.waiting.hold(&to, route.slot, body.to_vec(), Instant::now());
     }
-    // The router only learns that it's a call. Not who calls, not voice or video.
-    let call = headers.get("ft-call").is_some_and(|value| value == "1");
-    wake_as(&hub, &to, route.slot, call);
+    // Only a signed call tells the router who calls, and that must never be stored or logged.
+    match caller {
+        Some(caller) => ring_as_ruled(&hub, &to, route.slot, auth::caller_tag(&capability, &caller)),
+        None => wake_as(&hub, &to, route.slot, call),
+    }
     // Apps before 0.4 read 202 as "connected" and never fall back to the mailbox, hence 404.
     (StatusCode::NOT_FOUND, [("ft-retained", "1")]).into_response()
 }
@@ -427,8 +489,8 @@ async fn deposit(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: H
     if let Err(status) = hub.limit_origin(&headers) {
         return status;
     }
-    let route = match check_capability(&hub, &to, &headers).await {
-        Ok(route) => route,
+    let (route, _) = match check_capability(&hub, &to, &headers).await {
+        Ok(checked) => checked,
         Err(status) => return status,
     };
     if let Err(status) = hub.limit_recipient(&to) {
