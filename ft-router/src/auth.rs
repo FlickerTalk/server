@@ -37,6 +37,11 @@ pub fn device_id(public_key: &[u8; 32]) -> String {
     format!("ft_{}", bs58::encode(blake3::hash(public_key).as_bytes()).into_string())
 }
 
+/// Must match how the app derives it for the callers it mutes or blocks.
+pub fn caller_tag(capability: &[u8; 32], caller: &str) -> [u8; 32] {
+    *blake3::keyed_hash(capability, format!("ft-call-rule\n{caller}").as_bytes()).as_bytes()
+}
+
 pub fn decode_base64(text: &str) -> Result<Vec<u8>> {
     STANDARD_NO_PAD
         .decode(text.trim_end_matches('='))
@@ -102,6 +107,20 @@ mod tests {
         let public = key().verifying_key().to_bytes();
         let expected = format!("ft_{}", bs58::encode(blake3::hash(&public).as_bytes()).into_string());
         assert_eq!(device_id(&public), expected);
+    }
+
+    #[test]
+    fn the_caller_tag_is_pinned() {
+        let expected = "4470c37775236bc8cfd32b4f18c2d6fc272e3de23a86fb8a12cc88916cfa28a0";
+        let tag: String = caller_tag(&[2; 32], "ft_caller").iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(tag, expected);
+    }
+
+    #[test]
+    fn a_caller_tag_differs_by_capability_and_by_caller() {
+        let tag = caller_tag(&[2; 32], "ft_caller");
+        assert_ne!(caller_tag(&[3; 32], "ft_caller"), tag);
+        assert_ne!(caller_tag(&[2; 32], "ft_other"), tag);
     }
 
     #[test]
