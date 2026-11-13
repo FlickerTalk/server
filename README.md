@@ -11,6 +11,7 @@ so it cannot read them. [flickertalk.com](https://flickertalk.com)
 | Device ID, public key, hash of the routing code | Authenticate a phone's signed requests | Until the user erases the phone |
 | Push token, encrypted with a key kept outside the database | Wake a phone through FCM or APNs | Same, or until the provider says it expired |
 | Which of the phone's eight routing codes are silent: eight bits, nothing else | Keep a session the user has left unreachable | Replaced at every registration; until the user erases the phone |
+| Up to 1024 opaque 32-byte values, each with a rule (`quiet` or `none`) | Keep calls from contacts the user has muted or blocked from ringing the phone | Replaced when the phone sends a new list; until the user erases the phone |
 | Undelivered messages, end-to-end encrypted, without sender, each with the number (0–7) of the routing code it came through | Deliver them later; hold back those for a session the user has left; give each routing code its own quota | Until picked up, at most 7 days |
 | Connection offers and answers for a phone that is not connected, end-to-end encrypted | Hand them over as soon as it connects | In memory only, never on disk: until it connects, at most 55 seconds |
 | How many suggestions each device has sent in the last 24 hours | Limit suggestions | In memory only, never on disk or in a log |
@@ -27,6 +28,21 @@ woken at most once every 10 seconds, and after a ring the next one waits until t
 connected and 10 seconds have passed, or until the ring has run out after 45 seconds: a call sent
 again before the phone has connected does not ring it twice. The paces live in memory only, and the
 sender gets the same answer whether a push went out or not.
+
+A caller may also sign a call like any other request, over `POST`, the path `/v1/signal/{device ID}`
+and the body. A phone can register call rules (`call_rules`): a list of opaque 32-byte values, each
+with the rule `quiet` or `none`. The phone computes each value from a caller's device ID and the
+routing code it gave that caller (a BLAKE3 hash keyed with the routing code). The router stores only
+a hash of each routing code, so the values in the database cannot be linked to a caller on their
+own. For a signed call to a phone that is not connected, the router computes the caller's value and
+looks it up: `quiet` wakes the phone instead of ringing it, `none` sends no push, and a caller not in
+the list rings it as usual. The signal is held in all three cases and the caller gets the same
+answer. While it handles a signed call the router sees which device calls which, and whether the
+phone has muted or blocked that caller; it does not store or log any of it. A signed call with a bad
+signature is refused and nothing is held or pushed. Unsigned calls ring as before, and mail and other
+signals are never signed, so for them the router still does not learn who writes to whom. A
+registration without `call_rules` leaves the list as it is, an empty list clears it, and more than
+1024 values, a value that is not 32 bytes or an unknown rule is refused with `400`.
 
 A phone registers eight routing codes, most of them unused, and may say which are silent
 (`silent_slots`, bit *i* for code *i*; the first, the main list, is never silent). A silent code
@@ -70,9 +86,9 @@ A banned device's signed requests are refused with `403`, registration included,
 signal or mail addressed to it, with the same `403` as for a routing code that leads nowhere: nobody
 can wake it or drop into its mailbox. At start, and whenever the list changes, the router deletes
 the banned devices' registrations and the mail waiting for them, drops the signals it holds for
-them and closes their connections. Taking an ID off the list lifts the ban. Mail and signals carry
-no sender, so the router cannot tell what a banned device sends; the people it writes to can block
-it in the app.
+them and closes their connections. Taking an ID off the list lifts the ban. Mail and unsigned
+signals carry no sender, so the router cannot tell what a banned device sends through them; the
+people it writes to can block it in the app.
 
 No conversations, no contacts, no history, no access logs, no IP logs. There are no `/messages`,
 `/conversations`, `/users` or `/profiles` endpoints, and there never will be.
