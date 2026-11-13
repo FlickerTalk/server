@@ -354,7 +354,8 @@ fn wake_as(hub: &Arc<Hub>, device: &str, slot: u8, nudge: Nudge) {
     let Some(push) = hub.push.clone() else { return };
     let paced = match nudge {
         Nudge::Ring => push.ring_limiter.allow(device, slot),
-        Nudge::Wake | Nudge::QuietRing => push.limiter.allow(&format!("{device}/{slot}")),
+        Nudge::Wake => push.limiter.allow(&format!("{device}/{slot}")),
+        Nudge::QuietRing => push.limiter.allow(&format!("{device}/{slot}/quiet")),
     };
     if !paced {
         return;

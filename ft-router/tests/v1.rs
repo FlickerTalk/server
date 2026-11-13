@@ -2135,17 +2135,28 @@ async fn a_muted_or_blocked_caller_does_not_hold_back_the_next_ring() {
 }
 
 #[tokio::test]
-async fn a_quiet_call_keeps_the_wake_pace() {
+async fn a_quiet_call_keeps_a_pace_of_its_own() {
     let waker = Arc::new(FakeWaker::default());
     let router = router_with(push_with(waker.clone())).await;
     let alice = Device::new(1);
     alice.register(&router).await;
     let bob = callee_with_rules(&router, |bob| json!([call_rule(bob, &alice, "quiet")])).await;
+    let carol = Device::new(3);
+    assert_eq!(carol.register_with_call_rules(&router, json!([call_rule(&carol, &alice, "quiet")])).await.status(), 204);
+    assert_eq!(carol.set_push(&router, "carol-token").await.status(), 204);
+
+    deposit(&router, &bob, bob.capability(), b"sealed".to_vec()).await;
+    assert!(soon(|| waker.woken() == ["bob-token"]).await);
+    alice.call(&router, &bob).await;
+    assert!(soon(|| waker.quiet() == ["bob-token"]).await, "a wake just before does not hold it back");
+
+    alice.call(&router, &carol).await;
+    assert!(soon(|| waker.quiet() == ["bob-token", "carol-token"]).await);
+    deposit(&router, &carol, carol.capability(), b"sealed".to_vec()).await;
+    assert!(soon(|| waker.woken() == ["bob-token", "carol-token"]).await, "nor does it hold back a wake");
 
     alice.call(&router, &bob).await;
-    assert!(soon(|| waker.quiet() == ["bob-token"]).await);
-    deposit(&router, &bob, bob.capability(), b"sealed".to_vec()).await;
-    alice.call(&router, &bob).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!((waker.quiet().len(), waker.woken().len(), waker.rung().len()), (1, 0, 0));
+    assert_eq!(waker.quiet().len(), 2, "a second quiet call so soon waits");
+    assert!(waker.rung().is_empty());
 }

@@ -38,8 +38,9 @@ own. For a signed call to a phone that is not connected, the router computes the
 looks it up. For `quiet`, an Android phone gets the call push marked quiet (`"q": "1"`, nothing
 else), so the app can show the call without ringing; an iPhone gets the ordinary wake notification,
 because a VoIP push always rings there. For `none` no push is sent, and a caller not in the list
-rings the phone as usual. A quiet call is paced like a wake, and a call with no push takes no pace,
-so neither can hold back the next ring. The signal is held in all three cases and the caller gets
+rings the phone as usual. Quiet calls have a pace of their own, at most one push every 10 seconds
+per phone and routing code, apart from wakes and rings, and a call with no push takes no pace: a
+muted or blocked caller cannot hold back a ring, and a message cannot hold back a quiet call. The signal is held in all three cases and the caller gets
 the same answer. While it handles a signed call the router sees which device calls which, and whether the
 phone has muted or blocked that caller; it does not store or log any of it. A signed call with a bad
 signature is refused and nothing is held or pushed. Unsigned calls ring as before, and mail and other
