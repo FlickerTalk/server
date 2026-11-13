@@ -85,10 +85,16 @@ struct FakeWaker {
     slots: std::sync::Mutex<Vec<u8>>,
     rung: std::sync::Mutex<Vec<String>>,
     rung_slots: std::sync::Mutex<Vec<u8>>,
+    quiet: std::sync::Mutex<Vec<String>>,
 }
 
 #[async_trait::async_trait]
 impl Waker for FakeWaker {
+    async fn ring_quietly(&self, token: &str, _slot: u8) -> Wake {
+        self.quiet.lock().unwrap().push(token.to_owned());
+        Wake::Sent
+    }
+
     async fn wake(&self, token: &str, slot: u8) -> Wake {
         self.woken.lock().unwrap().push(token.to_owned());
         self.slots.lock().unwrap().push(slot);
@@ -120,6 +126,10 @@ impl FakeWaker {
 
     fn rung_slots(&self) -> Vec<u8> {
         self.rung_slots.lock().unwrap().clone()
+    }
+
+    fn quiet(&self) -> Vec<String> {
+        self.quiet.lock().unwrap().clone()
     }
 }
 
@@ -1902,17 +1912,22 @@ async fn callee_with_rules(router: &Router, rules: impl Fn(&Device) -> Value) ->
 }
 
 #[tokio::test]
-async fn a_signed_call_from_a_quiet_caller_wakes_without_ringing() {
-    let waker = Arc::new(FakeWaker::default());
-    let router = router_with(push_with(waker.clone())).await;
-    let alice = Device::new(1);
+async fn a_signed_call_from_a_quiet_caller_reaches_android_as_a_quiet_call_and_an_iphone_as_a_wake() {
+    let (android, iphones) = (Arc::new(FakeWaker::default()), Arc::new(FakeApns::default()));
+    let router = router_with(push_for_both(android.clone(), iphones.clone())).await;
+    let (alice, carol) = (Device::new(1), Device::new(3));
     alice.register(&router).await;
     let bob = callee_with_rules(&router, |bob| json!([call_rule(bob, &alice, "quiet")])).await;
+    assert_eq!(carol.register_with_call_rules(&router, json!([call_rule(&carol, &alice, "quiet")])).await.status(), 204);
+    assert_eq!(carol.set_push_with(&router, "apns", &iphone_target(0xc0)).await.status(), 204);
 
     assert_eq!(alice.call(&router, &bob).await.status(), 404);
-    assert!(soon(|| waker.woken() == ["bob-token"]).await);
+    assert_eq!(alice.call(&router, &carol).await.status(), 404);
+    assert!(soon(|| android.quiet() == ["bob-token"] && iphones.0.woken() == [iphone_target(0xc0)]).await);
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(waker.rung().is_empty());
+    assert!(android.woken().is_empty() && android.rung().is_empty());
+    assert_eq!(iphones.0.woken().len(), 1);
+    assert!(iphones.0.quiet().is_empty());
 }
 
 #[tokio::test]
@@ -2114,7 +2129,23 @@ async fn a_muted_or_blocked_caller_does_not_hold_back_the_next_ring() {
 
     carol.call(&router, &bob).await;
     alice.call(&router, &bob).await;
-    assert!(soon(|| waker.woken() == ["bob-token"]).await);
+    assert!(soon(|| waker.quiet() == ["bob-token"]).await);
     dave.call(&router, &bob).await;
     assert!(soon(|| waker.rung() == ["bob-token"]).await);
+}
+
+#[tokio::test]
+async fn a_quiet_call_keeps_the_wake_pace() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_with(waker.clone())).await;
+    let alice = Device::new(1);
+    alice.register(&router).await;
+    let bob = callee_with_rules(&router, |bob| json!([call_rule(bob, &alice, "quiet")])).await;
+
+    alice.call(&router, &bob).await;
+    assert!(soon(|| waker.quiet() == ["bob-token"]).await);
+    deposit(&router, &bob, bob.capability(), b"sealed".to_vec()).await;
+    alice.call(&router, &bob).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!((waker.quiet().len(), waker.woken().len(), waker.rung().len()), (1, 0, 0));
 }

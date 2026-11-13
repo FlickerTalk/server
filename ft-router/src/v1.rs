@@ -337,15 +337,25 @@ async fn clear_push(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Result<S
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Clone, Copy)]
+enum Nudge {
+    Wake,
+    Ring,
+    QuietRing,
+}
+
 fn wake(hub: &Arc<Hub>, device: &str, slot: u8) {
-    wake_as(hub, device, slot, false);
+    wake_as(hub, device, slot, Nudge::Wake);
 }
 
 /// Silent slots are checked in the background, after the pace is taken, so the sender sees the
 /// same answer and timing whether a push goes out or not.
-fn wake_as(hub: &Arc<Hub>, device: &str, slot: u8, call: bool) {
+fn wake_as(hub: &Arc<Hub>, device: &str, slot: u8, nudge: Nudge) {
     let Some(push) = hub.push.clone() else { return };
-    let paced = if call { push.ring_limiter.allow(device, slot) } else { push.limiter.allow(&format!("{device}/{slot}")) };
+    let paced = match nudge {
+        Nudge::Ring => push.ring_limiter.allow(device, slot),
+        Nudge::Wake | Nudge::QuietRing => push.limiter.allow(&format!("{device}/{slot}")),
+    };
     if !paced {
         return;
     }
@@ -354,7 +364,11 @@ fn wake_as(hub: &Arc<Hub>, device: &str, slot: u8, call: bool) {
         let Ok(Some((provider, sealed))) = hub.db.push_for(&device, slot).await else { return };
         let Some(waker) = push.waker(&provider) else { return };
         let Ok(token) = push.vault.open(&sealed) else { return };
-        let woke = if call { waker.ring(&token, slot).await } else { waker.wake(&token, slot).await };
+        let woke = match nudge {
+            Nudge::Wake => waker.wake(&token, slot).await,
+            Nudge::Ring => waker.ring(&token, slot).await,
+            Nudge::QuietRing => waker.ring_quietly(&token, slot).await,
+        };
         if woke == Wake::Unregistered {
             let _ = hub.db.clear_push(&device).await;
         }
@@ -369,8 +383,8 @@ fn ring_as_ruled(hub: &Arc<Hub>, device: &str, slot: u8, caller: [u8; 32]) {
     let (hub, device) = (hub.clone(), device.to_owned());
     tokio::spawn(async move {
         match hub.db.call_rule(&device, &caller).await {
-            Ok(None) => wake_as(&hub, &device, slot, true),
-            Ok(Some(CallRule::Quiet)) => wake_as(&hub, &device, slot, false),
+            Ok(None) => wake_as(&hub, &device, slot, Nudge::Ring),
+            Ok(Some(CallRule::Quiet)) => wake_as(&hub, &device, slot, Nudge::QuietRing),
             Ok(Some(CallRule::NoPush)) | Err(_) => {}
         }
     });
@@ -478,7 +492,7 @@ async fn signal(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: He
     // Only a signed call tells the router who calls, and that must never be stored or logged.
     match caller {
         Some(caller) => ring_as_ruled(&hub, &to, route.slot, auth::caller_tag(&capability, &caller)),
-        None => wake_as(&hub, &to, route.slot, call),
+        None => wake_as(&hub, &to, route.slot, if call { Nudge::Ring } else { Nudge::Wake }),
     }
     // Apps before 0.4 read 202 as "connected" and never fall back to the mailbox, hence 404.
     (StatusCode::NOT_FOUND, [("ft-retained", "1")]).into_response()

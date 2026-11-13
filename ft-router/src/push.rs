@@ -56,6 +56,11 @@ pub trait Waker: Send + Sync {
         self.wake(token, slot).await
     }
 
+    /// A VoIP push always rings an iPhone, so APNs sends a quiet call as a plain wake.
+    async fn ring_quietly(&self, token: &str, slot: u8) -> Wake {
+        self.wake(token, slot).await
+    }
+
     fn accepts(&self, token: &str) -> bool {
         !token.is_empty()
     }
@@ -225,21 +230,26 @@ impl Fcm {
 #[async_trait]
 impl Waker for Fcm {
     async fn wake(&self, token: &str, slot: u8) -> Wake {
-        self.send(token, "wake", slot, "60s").await
+        self.send(token, serde_json::json!({ "t": "wake", "s": slot.to_string() }), "60s").await
     }
 
     async fn ring(&self, token: &str, slot: u8) -> Wake {
-        self.send(token, "call", slot, &format!("{}s", RING_FOR.as_secs())).await
+        self.send(token, serde_json::json!({ "t": "call", "s": slot.to_string() }), &format!("{}s", RING_FOR.as_secs())).await
+    }
+
+    async fn ring_quietly(&self, token: &str, slot: u8) -> Wake {
+        let data = serde_json::json!({ "t": "call", "s": slot.to_string(), "q": "1" });
+        self.send(token, data, &format!("{}s", RING_FOR.as_secs())).await
     }
 }
 
 impl Fcm {
-    async fn send(&self, token: &str, kind: &str, slot: u8, ttl: &str) -> Wake {
+    async fn send(&self, token: &str, data: serde_json::Value, ttl: &str) -> Wake {
         let Ok(access) = self.access_token().await else { return Wake::Failed };
         let message = serde_json::json!({
             "message": {
                 "token": token,
-                "data": { "t": kind, "s": slot.to_string() },
+                "data": data,
                 "android": { "priority": "high", "ttl": ttl }
             }
         });
@@ -645,6 +655,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fcm_sends_a_quiet_call_as_a_call_marked_quiet() {
+        let (base, google, private_pem) = fake_google().await;
+        let fcm = Fcm::with_endpoint(account(&base, private_pem), &base).unwrap();
+
+        assert_eq!(fcm.ring_quietly("device-token", 2).await, Wake::Sent);
+
+        let messages = google.seen.messages.lock().unwrap().clone();
+        let message = &messages[0].1["message"];
+        assert_eq!(message["data"], serde_json::json!({ "t": "call", "s": "2", "q": "1" }));
+        assert_eq!(message["android"], serde_json::json!({ "priority": "high", "ttl": "45s" }));
+        assert!(message.get("notification").is_none());
+    }
+
+    #[tokio::test]
     async fn fcm_tells_when_a_token_is_gone() {
         let (base, _, private_pem) = fake_google().await;
         let fcm = Fcm::with_endpoint(account(&base, private_pem), &base).unwrap();
@@ -795,5 +819,22 @@ mod tests {
         assert_eq!(body["aps"]["alert"], serde_json::json!({ "loc-key": "FT_INCOMING_CALL" }));
         assert_eq!(headers["apns-expiration"], "0");
         assert_eq!((body["t"].as_str(), body["s"].as_u64()), (Some("call"), Some(0)));
+    }
+
+    #[tokio::test]
+    async fn apns_sends_a_quiet_call_as_a_plain_wake_even_with_pushkit() {
+        let (production, sandbox, at_production, _, private_pem, _) = fake_apple().await;
+        let apns = Apns::with_endpoints("TEAMID1234", "KEYID56789", private_pem.as_bytes(), TOPICS, &production, &sandbox).unwrap();
+        let voip = "cd".repeat(32);
+
+        assert_eq!(apns.ring_quietly(&format!("production:com.flickertalk.app:{DEVICE}:{voip}"), 2).await, Wake::Sent);
+
+        let sent = at_production.requests.lock().unwrap().clone();
+        let (path, headers, body) = &sent[0];
+        assert_eq!(path, &format!("/3/device/{DEVICE}"));
+        assert_eq!(headers["apns-topic"], "com.flickertalk.app");
+        assert_eq!(headers["apns-push-type"], "alert");
+        assert_eq!(body["aps"]["alert"], serde_json::json!({ "loc-key": "FT_PUSH_WAKE" }));
+        assert_eq!((body["t"].as_str(), body["s"].as_u64()), (Some("wake"), Some(2)));
     }
 }
