@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -43,6 +44,29 @@ pub struct Db {
 pub struct Route {
     pub slot: u8,
     pub silent: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallRule {
+    Quiet,
+    NoPush,
+}
+
+impl CallRule {
+    fn code(self) -> i16 {
+        match self {
+            Self::Quiet => 1,
+            Self::NoPush => 2,
+        }
+    }
+
+    fn from_code(code: i16) -> Result<Self> {
+        match code {
+            1 => Ok(Self::Quiet),
+            2 => Ok(Self::NoPush),
+            _ => bail!("unknown call rule"),
+        }
+    }
 }
 
 impl Db {
@@ -125,6 +149,34 @@ impl Db {
         }
         transaction.commit().await?;
         Ok(())
+    }
+
+    pub async fn set_call_rules(&self, device_id: &str, rules: &[([u8; 32], CallRule)]) -> Result<()> {
+        let mut listed = HashSet::new();
+        let (callers, codes): (Vec<&[u8]>, Vec<i16>) = rules
+            .iter()
+            .filter(|(caller, _)| listed.insert(*caller))
+            .map(|(caller, rule)| (caller.as_slice(), rule.code()))
+            .unzip();
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("DELETE FROM call_rules WHERE device_id = $1").bind(device_id).execute(&mut *transaction).await?;
+        sqlx::query("INSERT INTO call_rules (device_id, caller, rule) SELECT $1, * FROM UNNEST($2::bytea[], $3::smallint[])")
+            .bind(device_id)
+            .bind(callers)
+            .bind(codes)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn call_rule(&self, device_id: &str, caller: &[u8; 32]) -> Result<Option<CallRule>> {
+        let row = sqlx::query("SELECT rule FROM call_rules WHERE device_id = $1 AND caller = $2")
+            .bind(device_id)
+            .bind(caller.as_slice())
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| CallRule::from_code(row.get("rule"))).transpose()
     }
 
     pub async fn forget(&self, device_id: &str) -> Result<()> {
@@ -277,12 +329,13 @@ mod tests {
         Db::connect_isolated(&url()).await.expect("connects to the test database")
     }
 
-    const PRODUCTION_CHECKSUMS: [(i64, &str); 5] = [
+    const PRODUCTION_CHECKSUMS: [(i64, &str); 6] = [
         (1, "327824ab11e36398fe285d83f71aabf82598fa5919fa986eeb5ddb697efdd183a7340fb951ab88ddfde645244e8cbd79"),
         (2, "fa865ab6577314471029caa54f1164c8e67c01b8db3114b00769dcc7157d5899f924340f8b886bf3a7cac51a4c1349a9"),
         (3, "9caa8ac05f4ffadb55fac9d964f37f16a9ead308da414a894c6c6d062f6ec5304052c623b0bc5bfeba21e0f74ce9ef17"),
         (4, "b2d546e49f03d29c2863956f6ef1c8221a0727868f75257ed6ad206cb9a068e47752e96ff6387661d80c086e582ceaaa"),
         (5, "8e7d24d24d3ad7579e8a6ae306f98a2cae0c25d8430daf3a3f54ecebc686978f5eb91a9b32da8a6a21b2a70711c434fa"),
+        (6, "d84d941397e66d2fc43ddf82973c13cb4a05702fde29ac76cb015d6336eeaeb31d6329d832688d6fbb032c90bf41f373"),
     ];
 
     #[tokio::test]
@@ -592,5 +645,78 @@ mod tests {
         let db = Db::migrated(pool).await.expect("migrates the rest");
         assert_eq!(collectable(&db, "ft_old").await, [b"waiting".to_vec()]);
         assert_eq!(db.persistence("mailbox").await.unwrap(), "u");
+    }
+
+    const MUTED_CALLER: [u8; 32] = [7; 32];
+    const UNLISTED_CALLER: [u8; 32] = [9; 32];
+
+    #[tokio::test]
+    async fn a_call_rule_is_found_only_for_the_caller_it_was_set_for() {
+        let db = db().await;
+        db.register("ft_a", &KEY, &capability_hash(), 0).await.expect("registers");
+
+        db.set_call_rules("ft_a", &[(MUTED_CALLER, CallRule::Quiet)]).await.expect("stores the rules");
+
+        assert_eq!(db.call_rule("ft_a", &MUTED_CALLER).await.unwrap(), Some(CallRule::Quiet));
+        assert_eq!(db.call_rule("ft_a", &UNLISTED_CALLER).await.unwrap(), None);
+    }
+
+    const BLOCKED_CALLER: [u8; 32] = [8; 32];
+
+    #[tokio::test]
+    async fn a_new_list_of_call_rules_replaces_the_old_one() {
+        let db = db().await;
+        db.register("ft_a", &KEY, &capability_hash(), 0).await.expect("registers");
+        db.set_call_rules("ft_a", &[(MUTED_CALLER, CallRule::Quiet), (BLOCKED_CALLER, CallRule::NoPush)]).await.expect("stores");
+        assert_eq!(db.call_rule("ft_a", &BLOCKED_CALLER).await.unwrap(), Some(CallRule::NoPush));
+
+        db.set_call_rules("ft_a", &[(MUTED_CALLER, CallRule::NoPush)]).await.expect("replaces");
+
+        assert_eq!(db.call_rule("ft_a", &MUTED_CALLER).await.unwrap(), Some(CallRule::NoPush));
+        assert_eq!(db.call_rule("ft_a", &BLOCKED_CALLER).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn an_empty_list_clears_the_call_rules() {
+        let db = db().await;
+        db.register("ft_a", &KEY, &capability_hash(), 0).await.expect("registers");
+        db.set_call_rules("ft_a", &[(MUTED_CALLER, CallRule::Quiet)]).await.expect("stores");
+
+        db.set_call_rules("ft_a", &[]).await.expect("clears");
+
+        assert_eq!(db.call_rule("ft_a", &MUTED_CALLER).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn forgetting_a_device_removes_its_call_rules() {
+        let db = db().await;
+        db.register("ft_a", &KEY, &capability_hash(), 0).await.expect("registers");
+        db.set_call_rules("ft_a", &[(MUTED_CALLER, CallRule::Quiet)]).await.expect("stores");
+
+        db.forget("ft_a").await.expect("forgets");
+        db.register("ft_a", &KEY, &capability_hash(), 0).await.expect("registers again");
+
+        assert_eq!(db.call_rule("ft_a", &MUTED_CALLER).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn another_devices_call_rule_is_not_found() {
+        let db = db().await;
+        db.register("ft_a", &KEY, &capability_hash(), 0).await.expect("registers");
+        db.register("ft_b", &[3; 32], &capability_hash(), 0).await.expect("registers");
+        db.set_call_rules("ft_a", &[(MUTED_CALLER, CallRule::Quiet)]).await.expect("stores");
+
+        assert_eq!(db.call_rule("ft_b", &MUTED_CALLER).await.unwrap(), None);
+        assert_eq!(db.call_rule("ft_unknown", &MUTED_CALLER).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_caller_listed_twice_keeps_its_first_rule() {
+        let db = db().await;
+        db.register("ft_a", &KEY, &capability_hash(), 0).await.expect("registers");
+
+        db.set_call_rules("ft_a", &[(MUTED_CALLER, CallRule::Quiet), (MUTED_CALLER, CallRule::NoPush)]).await.expect("stores");
+
+        assert_eq!(db.call_rule("ft_a", &MUTED_CALLER).await.unwrap(), Some(CallRule::Quiet));
     }
 }
