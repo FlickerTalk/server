@@ -56,7 +56,6 @@ pub trait Waker: Send + Sync {
         self.wake(token, slot).await
     }
 
-    /// A VoIP push always rings an iPhone, so APNs sends a quiet call as a plain wake.
     async fn ring_quietly(&self, token: &str, slot: u8) -> Wake {
         self.wake(token, slot).await
     }
@@ -417,22 +416,31 @@ impl Apns {
             Err(_) => Wake::Failed,
         }
     }
+
+    async fn wake_notification(&self, target: &str, slot: u8, sound: Option<&str>) -> Wake {
+        let Some(target) = apns_target(target, &self.topics) else { return Wake::Unregistered };
+        let expiration = SystemTime::now().duration_since(UNIX_EPOCH).map(|now| now.as_secs() + APNS_KEEP_FOR).unwrap_or(0);
+        // The phone translates the loc-key, so there's no text and no language on our side.
+        // mutable-content is for the notification service extension, once the app has one.
+        let mut aps = serde_json::json!({ "alert": { "loc-key": "FT_PUSH_WAKE" }, "mutable-content": 1 });
+        if let Some(sound) = sound {
+            aps["sound"] = sound.into();
+        }
+        let body = serde_json::json!({ "aps": aps, "t": "wake", "s": slot });
+        let push = ApnsPush { gateway: target.gateway, token: target.token, topic: target.topic.to_owned(), kind: "alert", expiration, collapse: Some("ft-wake"), body };
+        self.send(push).await
+    }
 }
 
 #[async_trait]
 impl Waker for Apns {
     async fn wake(&self, target: &str, slot: u8) -> Wake {
-        let Some(target) = apns_target(target, &self.topics) else { return Wake::Unregistered };
-        let expiration = SystemTime::now().duration_since(UNIX_EPOCH).map(|now| now.as_secs() + APNS_KEEP_FOR).unwrap_or(0);
-        // The phone translates the loc-key, so there's no text and no language on our side.
-        // mutable-content is for the notification service extension, once the app has one.
-        let body = serde_json::json!({
-            "aps": { "alert": { "loc-key": "FT_PUSH_WAKE" }, "sound": "default", "mutable-content": 1 },
-            "t": "wake",
-            "s": slot,
-        });
-        let push = ApnsPush { gateway: target.gateway, token: target.token, topic: target.topic.to_owned(), kind: "alert", expiration, collapse: Some("ft-wake"), body };
-        self.send(push).await
+        self.wake_notification(target, slot, Some("default")).await
+    }
+
+    /// A VoIP push always rings an iPhone, so a quiet call is the wake notification without its sound.
+    async fn ring_quietly(&self, target: &str, slot: u8) -> Wake {
+        self.wake_notification(target, slot, None).await
     }
 
     /// Apple wants every VoIP push to ring through CallKit, so PushKit is only used for calls.
@@ -740,6 +748,7 @@ mod tests {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         assert!(expiration > now + 3600 && expiration <= now + 86_400 + 5, "kept a day if the phone is off");
         assert_eq!(body["aps"]["alert"], serde_json::json!({ "loc-key": "FT_PUSH_WAKE" }));
+        assert_eq!(body["aps"]["sound"], "default");
         assert_eq!(body["aps"]["mutable-content"], 1);
         assert_eq!((body["t"].as_str(), body["s"].as_u64()), (Some("wake"), Some(3)));
         let text = body.to_string();
@@ -822,7 +831,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apns_sends_a_quiet_call_as_a_plain_wake_even_with_pushkit() {
+    async fn apns_sends_a_quiet_call_as_the_wake_notification_without_a_sound_even_with_pushkit() {
         let (production, sandbox, at_production, _, private_pem, _) = fake_apple().await;
         let apns = Apns::with_endpoints("TEAMID1234", "KEYID56789", private_pem.as_bytes(), TOPICS, &production, &sandbox).unwrap();
         let voip = "cd".repeat(32);
@@ -834,7 +843,14 @@ mod tests {
         assert_eq!(path, &format!("/3/device/{DEVICE}"));
         assert_eq!(headers["apns-topic"], "com.flickertalk.app");
         assert_eq!(headers["apns-push-type"], "alert");
-        assert_eq!(body["aps"]["alert"], serde_json::json!({ "loc-key": "FT_PUSH_WAKE" }));
-        assert_eq!((body["t"].as_str(), body["s"].as_u64()), (Some("wake"), Some(2)));
+        assert_eq!(headers["apns-collapse-id"], "ft-wake");
+        assert_eq!(
+            body,
+            &serde_json::json!({
+                "aps": { "alert": { "loc-key": "FT_PUSH_WAKE" }, "mutable-content": 1 },
+                "t": "wake",
+                "s": 2,
+            })
+        );
     }
 }

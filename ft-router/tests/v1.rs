@@ -2160,3 +2160,118 @@ async fn a_quiet_call_keeps_a_pace_of_its_own() {
     assert_eq!(waker.quiet().len(), 2, "a second quiet call so soon waits");
     assert!(waker.rung().is_empty());
 }
+
+async fn signal_with(router: &Router, to: &Device, headers: &[(&str, &str)], bytes: Vec<u8>) -> reqwest::Response {
+    let mut request = router.http.post(format!("{}/v1/signal/{}", router.base, to.id())).header("ft-capability", to.capability()).body(bytes);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    request.send().await.expect("answers")
+}
+
+#[tokio::test]
+async fn a_signal_marked_not_to_wake_sends_no_push_but_waits_for_the_phone() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_with(waker.clone())).await;
+    let bob = Device::new(2);
+    bob.register(&router).await;
+    bob.set_push(&router, "bob-token").await;
+
+    let answer = signal_with(&router, &bob, &[("ft-wake", "0")], b"reconnect offer".to_vec()).await;
+    assert_eq!(answer.status(), 404);
+    assert_eq!(answer.headers().get("ft-retained").map(|value| value.to_str().unwrap()), Some("1"));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(waker.woken().is_empty() && waker.rung().is_empty() && waker.quiet().is_empty());
+
+    let mut socket = bob.connect(&router).await;
+    assert_eq!(next_json(&mut socket).await["kind"], "welcome");
+    assert_eq!(next_signal(&mut socket).await, b"reconnect offer");
+    assert!(nothing_more(&mut socket).await);
+}
+
+#[tokio::test]
+async fn a_signal_marked_not_to_wake_reaches_a_connected_phone() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_with(waker.clone())).await;
+    let bob = Device::new(2);
+    bob.register(&router).await;
+    bob.set_push(&router, "bob-token").await;
+    let mut socket = bob.connect(&router).await;
+    assert_eq!(next_json(&mut socket).await["kind"], "welcome");
+
+    assert_eq!(signal_with(&router, &bob, &[("ft-wake", "0")], b"reconnect offer".to_vec()).await.status(), 202);
+    assert_eq!(next_signal(&mut socket).await, b"reconnect offer");
+}
+
+#[tokio::test]
+async fn a_signal_marked_not_to_wake_gets_the_same_answer_as_any_other() {
+    let router = router_with(push_with(Arc::default())).await;
+    let bob = Device::new(2);
+    bob.register(&router).await;
+    bob.set_push(&router, "bob-token").await;
+
+    let plain = seen(signal(&router, &bob, bob.capability(), b"offer".to_vec()).await).await;
+    let marked = seen(signal_with(&router, &bob, &[("ft-wake", "0")], b"offer".to_vec()).await).await;
+    assert_eq!(marked, plain);
+    assert_eq!(plain.0, 404);
+
+    let mut socket = bob.connect(&router).await;
+    assert_eq!(next_json(&mut socket).await["kind"], "welcome");
+    let plain = seen(signal(&router, &bob, bob.capability(), b"offer".to_vec()).await).await;
+    let marked = seen(signal_with(&router, &bob, &[("ft-wake", "0")], b"offer".to_vec()).await).await;
+    assert_eq!(marked, plain);
+    assert_eq!(plain.0, 202);
+}
+
+#[tokio::test]
+async fn a_call_marked_not_to_wake_still_rings() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_with(waker.clone())).await;
+    let (alice, carol) = (Device::new(1), Device::new(3));
+    alice.register(&router).await;
+    carol.register(&router).await;
+    carol.set_push(&router, "carol-token").await;
+    let bob = callee_with_rules(&router, |_| json!([])).await;
+
+    let unsigned = signal_with(&router, &carol, &[("ft-call", "1"), ("ft-wake", "0")], b"call offer".to_vec()).await;
+    assert_eq!(unsigned.status(), 404);
+    let mut signed = alice.signed_call_headers(&bob);
+    signed.push(("ft-wake", "0".to_owned()));
+    assert_eq!(alice.call_signed(&router, &bob, signed).await.status(), 404);
+
+    assert!(soon(|| waker.rung().len() == 2).await);
+    let mut rung = waker.rung();
+    rung.sort();
+    assert_eq!(rung, ["bob-token", "carol-token"]);
+    assert!(waker.woken().is_empty());
+}
+
+#[tokio::test]
+async fn a_signal_marked_not_to_wake_does_not_hold_back_the_next_wake() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_with(waker.clone())).await;
+    let bob = Device::new(2);
+    bob.register(&router).await;
+    bob.set_push(&router, "bob-token").await;
+
+    signal_with(&router, &bob, &[("ft-wake", "0")], b"reconnect offer".to_vec()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(waker.woken().is_empty());
+
+    signal(&router, &bob, bob.capability(), b"offer".to_vec()).await;
+    assert!(soon(|| waker.woken() == ["bob-token"]).await);
+}
+
+#[tokio::test]
+async fn any_other_ft_wake_value_wakes_as_before() {
+    let waker = Arc::new(FakeWaker::default());
+    let router = router_with(push_paced(waker.clone(), Arc::default(), Duration::ZERO)).await;
+    let bob = Device::new(2);
+    bob.register(&router).await;
+    bob.set_push(&router, "bob-token").await;
+
+    for value in ["1", "00", "false", "no"] {
+        assert_eq!(signal_with(&router, &bob, &[("ft-wake", value)], b"offer".to_vec()).await.status(), 404);
+    }
+    assert!(soon(|| waker.woken().len() == 4).await);
+}

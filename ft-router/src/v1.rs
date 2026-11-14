@@ -467,6 +467,7 @@ async fn signal(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: He
         Err(status) => return status.into_response(),
     };
     let call = headers.get("ft-call").is_some_and(|value| value == "1");
+    let wake = call || headers.get("ft-wake").is_none_or(|value| value != "0");
     let caller = if call && Signature::present(&headers) {
         let path = format!("/v1/signal/{to}");
         match authenticate(&hub, "POST", &path, Signature::from_headers(&headers), &body, None).await {
@@ -493,7 +494,8 @@ async fn signal(State(hub): State<Arc<Hub>>, Path(to): Path<String>, headers: He
     // Only a signed call tells the router who calls, and that must never be stored or logged.
     match caller {
         Some(caller) => ring_as_ruled(&hub, &to, route.slot, auth::caller_tag(&capability, &caller)),
-        None => wake_as(&hub, &to, route.slot, if call { Nudge::Ring } else { Nudge::Wake }),
+        None if wake => wake_as(&hub, &to, route.slot, if call { Nudge::Ring } else { Nudge::Wake }),
+        None => {}
     }
     // Apps before 0.4 read 202 as "connected" and never fall back to the mailbox, hence 404.
     (StatusCode::NOT_FOUND, [("ft-retained", "1")]).into_response()
