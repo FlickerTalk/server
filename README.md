@@ -109,6 +109,11 @@ cargo test --workspace
 docker build -t ft-router .
 ```
 
+Before opening a pull request, run `scripts/quality-check.sh`. It checks only the Rust files your
+branch changes: each must be formatted with `cargo fmt`, no function may run over 100 lines or nest
+blocks more than 5 deep, and a file outside `tests/` may not pass 500 lines, nor grow if it already
+has more.
+
 The expected TURN password in `ft-router/src/turn.rs` comes from openssl, not from the router's
 code. To compute it again:
 
