@@ -20,7 +20,10 @@ so it cannot read them. [flickertalk.com](https://flickertalk.com)
 A signal for a phone that is not connected is answered `404` with `ft-retained: 1`: the router
 wakes the phone and holds the signal in memory (eight per phone and 32 MiB in all, the oldest
 dropped first) to hand it over, in order and once, when the phone connects. Because it lives in
-memory, the router runs as a single replica.
+memory, the router runs as a single replica. A signal marked `ft-wake: 0`, which the app uses for
+the offers it sends on its own to reconnect, is held and answered the same way, but nothing is
+pushed for it, so it wakes nobody and does not hold back the next wake. On a call the mark is
+ignored.
 
 A caller marks a call's signal with `ft-call: 1`, and the phone is rung instead of woken. Wakes and
 rings are paced apart, per phone and routing code, so a message never holds back a call: a phone is
@@ -36,9 +39,9 @@ routing code it gave that caller (a BLAKE3 hash keyed with the routing code). Th
 a hash of each routing code, so the values in the database cannot be linked to a caller on their
 own. For a signed call to a phone that is not connected, the router computes the caller's value and
 looks it up. For `quiet`, an Android phone gets the call push marked quiet (`"q": "1"`, nothing
-else), so the app can show the call without ringing; an iPhone gets the ordinary wake notification,
-because a VoIP push always rings there. For `none` no push is sent, and a caller not in the list
-rings the phone as usual. Quiet calls have a pace of their own, at most one push every 10 seconds
+else), so the app can show the call without ringing; an iPhone gets the wake notification without
+its sound, because a VoIP push always rings there. For `none` no push is sent, and a caller not in
+the list rings the phone as usual. Quiet calls have a pace of their own, at most one push every 10 seconds
 per phone and routing code, apart from wakes and rings, and a call with no push takes no pace: a
 muted or blocked caller cannot hold back a ring, and a message cannot hold back a quiet call. The signal is held in all three cases and the caller gets
 the same answer. While it handles a signed call the router sees which device calls which, and whether the
